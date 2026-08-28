@@ -16,6 +16,60 @@ struct FanInfo: Identifiable, Equatable {
 enum FanMode: String {
     case auto
     case fixed
+    case curve
+}
+
+struct FanCurvePoint: Identifiable, Codable, Equatable {
+    var id: UUID
+    var celsius: Double
+    var rpm: Double
+
+    init(id: UUID = UUID(), celsius: Double, rpm: Double) {
+        self.id = id
+        self.celsius = celsius
+        self.rpm = rpm
+    }
+}
+
+enum FanCurve {
+    static let defaults: [FanCurvePoint] = [
+        FanCurvePoint(celsius: 55, rpm: 2000),
+        FanCurvePoint(celsius: 70, rpm: 3500),
+        FanCurvePoint(celsius: 85, rpm: 5200),
+    ]
+
+    /// Highest matching threshold; below all points uses `floor`.
+    static func rpm(for temp: Double, points: [FanCurvePoint], floor: Double) -> Double {
+        let sorted = points.sorted { $0.celsius < $1.celsius }
+        var result = floor
+        for point in sorted where temp >= point.celsius {
+            result = point.rpm
+        }
+        return result
+    }
+
+    static func runSelfTest() -> Int32 {
+        let points = [
+            FanCurvePoint(celsius: 50, rpm: 2000),
+            FanCurvePoint(celsius: 70, rpm: 4000),
+            FanCurvePoint(celsius: 85, rpm: 5700),
+        ]
+        let cases: [(Double, Double)] = [
+            (40, 1200), (50, 2000), (73, 4000), (85, 5700), (90, 5700),
+        ]
+        for (temp, expected) in cases {
+            let got = rpm(for: temp, points: points, floor: 1200)
+            if got != expected {
+                fputs("curve selftest failed: \(temp) -> \(got) expected \(expected)\n", stderr)
+                return 1
+            }
+        }
+        if rpm(for: 60, points: [], floor: 1200) != 1200 {
+            fputs("curve selftest failed: empty points\n", stderr)
+            return 1
+        }
+        return 0
+    }
 }
 
 enum PrivilegedWriter {
@@ -129,17 +183,9 @@ enum HelperCLI {
         if argv[3] == "auto" {
             var ok = true
             for i in indices {
-                if !setMode(smc, fanIndex: i, value: 0) { ok = false }
-                if var flags = smc.readUInt8("FS! ") {
-                    flags &= ~(1 << i)
-                    _ = smc.writeData("FS! ", bytes: [flags, 0])
-                }
+                if !releaseToAuto(smc, fanIndex: i) { ok = false }
             }
-            let allAuto = (0..<count).allSatisfy { i in
-                guard let mk = modeKey(smc, fanIndex: i) else { return true }
-                return smc.readUInt8(mk) != 1
-            }
-            if allAuto, smc.keyInfo("Ftst") != nil {
+            if smc.keyInfo("Ftst") != nil {
                 _ = smc.writeDouble("Ftst", value: 0)
             }
             return ok ? 0 : 1
@@ -155,7 +201,7 @@ enum HelperCLI {
             let minRPM = smc.readDouble("F\(i)Mn") ?? 0
             let maxRPM = smc.readDouble("F\(i)Mx") ?? rpm
             let clamped = min(max(rpm, minRPM), maxRPM)
-            if modeKey(smc, fanIndex: i) != nil, !setMode(smc, fanIndex: i, value: 1) {
+            if modeKey(smc, fanIndex: i) != nil, !setManual(smc, fanIndex: i) {
                 fputs("OneBar: manual mode rejected for fan \(i)\n", stderr)
                 ok = false
                 continue
@@ -181,46 +227,83 @@ enum HelperCLI {
         ["F\(fanIndex)Md", "F\(fanIndex)md"].first { smc.keyInfo($0) != nil }
     }
 
-    private static func setMode(_ smc: SMC, fanIndex: Int, value: UInt8) -> Bool {
+    /// Manual is mode 1. Auto is 0; Apple Silicon thermalmonitord uses 3 (system). Both 0 and 3 mean "not ours".
+    private static func isHeldManual(_ smc: SMC, fanIndex: Int) -> Bool {
         guard let mk = modeKey(smc, fanIndex: fanIndex) else { return false }
-        if smc.readUInt8(mk) == value { return true }
-        _ = smc.writeDouble(mk, value: Double(value))
-        if smc.readUInt8(mk) == value { return true }
+        return smc.readUInt8(mk) == 1
+    }
+
+    private static func setManual(_ smc: SMC, fanIndex: Int) -> Bool {
+        guard let mk = modeKey(smc, fanIndex: fanIndex) else { return true }
+        if smc.readUInt8(mk) == 1 { return true }
+        _ = smc.writeDouble(mk, value: 1)
+        if smc.readUInt8(mk) == 1 { return true }
         guard smc.keyInfo("Ftst") != nil else { return false }
         _ = smc.writeDouble("Ftst", value: 1)
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
-            _ = smc.writeDouble(mk, value: Double(value))
-            if smc.readUInt8(mk) == value { return true }
+            _ = smc.writeDouble(mk, value: 1)
+            if smc.readUInt8(mk) == 1 { return true }
             usleep(100_000)
         }
-        return false
+        return smc.readUInt8(mk) == 1
+    }
+
+    private static func releaseToAuto(_ smc: SMC, fanIndex: Int) -> Bool {
+        if var flags = smc.readUInt8("FS! ") {
+            flags &= ~(1 << fanIndex)
+            _ = smc.writeData("FS! ", bytes: [flags, 0])
+        }
+        guard let mk = modeKey(smc, fanIndex: fanIndex) else { return true }
+        if !isHeldManual(smc, fanIndex: fanIndex) { return true }
+        _ = smc.writeDouble(mk, value: 0)
+        if !isHeldManual(smc, fanIndex: fanIndex) { return true }
+        if smc.keyInfo("Ftst") != nil {
+            _ = smc.writeDouble("Ftst", value: 0)
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            _ = smc.writeDouble(mk, value: 0)
+            if !isHeldManual(smc, fanIndex: fanIndex) { return true }
+            usleep(100_000)
+        }
+        return !isHeldManual(smc, fanIndex: fanIndex)
     }
 }
 
 @MainActor
 final class FanController: ObservableObject {
+    private static let modeKey = "onebar.fan.mode"
+    private static let rpmKey = "onebar.fan.rpm"
+    private static let curveKey = "onebar.fan.curve"
+
     @Published var fans: [FanInfo] = []
     @Published var cpuTemp: Double?
     @Published var hottestTemp: Double?
     @Published var isConnected = false
     @Published var errorMessage: String?
     @Published var needsAdmin = false
+    @Published var writeError: String?
     @Published var passwordless = false
     @Published var competitor: String?
     @Published var mode: FanMode {
-        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "onebar.fan.mode") }
+        didSet { UserDefaults.standard.set(mode.rawValue, forKey: Self.modeKey) }
     }
-    @Published var fixedRPM: Double {
-        didSet { UserDefaults.standard.set(fixedRPM, forKey: "onebar.fan.rpm") }
-    }
+    @Published var fixedRPM: Double
+    @Published var curvePoints: [FanCurvePoint]
     @Published var applying = false
+    @Published private(set) var curveTargetRPM: Double = 0
 
     private let smc = SMC()
     private var timer: Timer?
     private var lastReapply = Date.distantPast
+    private var lastAppliedRPM: Double?
+    private var applyGeneration = 0
     private var cpuKeys: [String] = []
     private var tempKeys: [String] = []
+    private var isEditingSpeed = false
+    private var speedEditBegan = Date.distantPast
+    private var curveDebounce: DispatchWorkItem?
 
     var sliderMin: Double {
         fans.map(\.minRPM).min() ?? 1200
@@ -242,10 +325,11 @@ final class FanController: ObservableObject {
     }
 
     init() {
-        let stored = UserDefaults.standard.string(forKey: "onebar.fan.mode") ?? FanMode.auto.rawValue
+        let stored = UserDefaults.standard.string(forKey: Self.modeKey) ?? FanMode.auto.rawValue
         mode = FanMode(rawValue: stored) ?? .auto
-        let rpm = UserDefaults.standard.object(forKey: "onebar.fan.rpm") as? Double ?? 5000
+        let rpm = UserDefaults.standard.object(forKey: Self.rpmKey) as? Double ?? 5000
         fixedRPM = rpm
+        curvePoints = Self.loadCurve()
         passwordless = PrivilegedWriter.hasPasswordlessSudo()
         if smc.open() {
             isConnected = true
@@ -257,12 +341,34 @@ final class FanController: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.discoverTemps()
                 self?.refreshTemps()
-            }
-            if mode == .fixed {
-                applyFixed(silent: true)
+                self?.refreshCurveTarget()
+                if self?.mode == .fixed {
+                    self?.applyFixed(silent: true)
+                } else if self?.mode == .curve {
+                    self?.applyCurveIfNeeded(force: true, silent: true)
+                }
             }
         } else {
             errorMessage = "找不到 SMC（需要实体 Mac）"
+        }
+    }
+
+    private static func loadCurve() -> [FanCurvePoint] {
+        guard let data = UserDefaults.standard.data(forKey: curveKey),
+              let points = try? JSONDecoder().decode([FanCurvePoint].self, from: data),
+              !points.isEmpty else {
+            return FanCurve.defaults
+        }
+        return points
+    }
+
+    private func persistRPM() {
+        UserDefaults.standard.set(fixedRPM, forKey: Self.rpmKey)
+    }
+
+    private func persistCurve() {
+        if let data = try? JSONEncoder().encode(curvePoints) {
+            UserDefaults.standard.set(data, forKey: Self.curveKey)
         }
     }
 
@@ -283,9 +389,6 @@ final class FanController: ObservableObject {
                 targetRPM: smc.readDouble("F\(index)Tg") ?? actual,
                 isManual: isManual(index: index)
             )
-        }
-        if let firstMax = fans.map(\.maxRPM).max(), fixedRPM > firstMax + 1 {
-            // keep user value; clamp happens on write
         }
     }
 
@@ -308,11 +411,18 @@ final class FanController: ObservableObject {
         }
         refreshTemps()
         competitor = Self.detectCompetitor()
-        if mode == .fixed, Date().timeIntervalSince(lastReapply) > 8 {
-            let allManual = fans.allSatisfy(\.isManual)
-            if !allManual {
+        refreshCurveTarget()
+        if isEditingSpeed, Date().timeIntervalSince(speedEditBegan) < 30 { return }
+        isEditingSpeed = false
+        switch mode {
+        case .fixed:
+            if Date().timeIntervalSince(lastReapply) > 8, !fans.allSatisfy(\.isManual) {
                 applyFixed(silent: true)
             }
+        case .curve:
+            applyCurveIfNeeded(force: false, silent: true)
+        case .auto:
+            break
         }
     }
 
@@ -345,6 +455,14 @@ final class FanController: ObservableObject {
         hottestTemp = hottest
     }
 
+    func refreshCurveTarget() {
+        let temp = cpuTemp ?? hottestTemp ?? 0
+        let floor = sliderMin
+        var target = FanCurve.rpm(for: temp, points: curvePoints, floor: floor)
+        if temp >= 100 { target = sliderMax }
+        curveTargetRPM = min(max(target, sliderMin), sliderMax)
+    }
+
     static func detectCompetitor() -> String? {
         let apps = NSWorkspace.shared.runningApplications
         if apps.contains(where: {
@@ -358,6 +476,7 @@ final class FanController: ObservableObject {
 
     func authorize() {
         applying = true
+        writeError = nil
         Task.detached { [weak self] in
             let ok = PrivilegedWriter.ensureAuthorized()
             await MainActor.run { [weak self] in
@@ -372,13 +491,16 @@ final class FanController: ObservableObject {
     func selectAuto() {
         mode = .auto
         applying = true
+        writeError = nil
+        applyGeneration += 1
+        let generation = applyGeneration
         Task.detached { [weak self] in
             let ok = PrivilegedWriter.setAllAuto()
+            let passwordless = ok || PrivilegedWriter.hasPasswordlessSudo()
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.applyGeneration == generation else { return }
                 self.applying = false
-                self.passwordless = PrivilegedWriter.hasPasswordlessSudo()
-                self.needsAdmin = !ok
+                self.recordResult(ok: ok, passwordless: passwordless, failText: "交还系统控制失败，请再试一次。")
                 if ok {
                     for i in self.fans.indices { self.fans[i].isManual = false }
                 }
@@ -391,10 +513,82 @@ final class FanController: ObservableObject {
         applyFixed()
     }
 
-    func applyFixed(silent: Bool = false) {
-        let rpm = min(max(fixedRPM, sliderMin), sliderMax)
-        fixedRPM = rpm
+    func selectCurve() {
+        mode = .curve
+        refreshCurveTarget()
+        applyCurveIfNeeded(force: true, silent: false)
+    }
+
+    func beginSpeedEdit() {
+        isEditingSpeed = true
+        speedEditBegan = Date()
+    }
+
+    func applyFixed(rpm: Double? = nil, silent: Bool = false) {
+        isEditingSpeed = false
+        if let rpm {
+            fixedRPM = rpm
+        }
+        let clamped = min(max(fixedRPM, sliderMin), sliderMax)
+        fixedRPM = clamped
+        persistRPM()
+        writeRPM(clamped, silent: silent)
+    }
+
+    func addCurvePoint() {
+        guard curvePoints.count < 8 else { return }
+        let last = curvePoints.max(by: { $0.celsius < $1.celsius })
+        let nextTemp = min(99, (last?.celsius ?? 50) + 10)
+        let nextRPM = min(sliderMax, (last?.rpm ?? sliderMin) + 500)
+        curvePoints.append(FanCurvePoint(celsius: nextTemp, rpm: nextRPM))
+        persistCurve()
+        scheduleCurveApply()
+    }
+
+    func removeCurvePoint(_ id: UUID) {
+        guard curvePoints.count > 1 else { return }
+        curvePoints.removeAll { $0.id == id }
+        persistCurve()
+        scheduleCurveApply()
+    }
+
+    func updateCurvePoint(id: UUID, celsius: Double? = nil, rpm: Double? = nil) {
+        guard let index = curvePoints.firstIndex(where: { $0.id == id }) else { return }
+        if let celsius {
+            curvePoints[index].celsius = min(max(celsius, 0), 110)
+        }
+        if let rpm {
+            curvePoints[index].rpm = min(max(rpm, sliderMin), sliderMax)
+        }
+        persistCurve()
+        scheduleCurveApply()
+    }
+
+    private func scheduleCurveApply() {
+        refreshCurveTarget()
+        guard mode == .curve else { return }
+        curveDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyCurveIfNeeded(force: true, silent: false)
+        }
+        curveDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
+    private func applyCurveIfNeeded(force: Bool, silent: Bool) {
+        refreshCurveTarget()
+        let target = curveTargetRPM
+        let stale = Date().timeIntervalSince(lastReapply) > 8 && !fans.allSatisfy(\.isManual)
+        let changed = lastAppliedRPM.map { abs($0 - target) >= 80 } ?? true
+        guard force || stale || changed else { return }
+        writeRPM(target, silent: silent)
+    }
+
+    private func writeRPM(_ rpm: Double, silent: Bool) {
+        lastAppliedRPM = rpm
         lastReapply = Date()
+        applyGeneration += 1
+        let generation = applyGeneration
         if silent {
             Task.detached {
                 _ = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: false)
@@ -402,14 +596,31 @@ final class FanController: ObservableObject {
             return
         }
         applying = true
+        writeError = nil
         Task.detached { [weak self] in
             let ok = PrivilegedWriter.setAllFixed(rpm: rpm)
+            let passwordless = ok || PrivilegedWriter.hasPasswordlessSudo()
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.applyGeneration == generation else { return }
                 self.applying = false
-                self.passwordless = PrivilegedWriter.hasPasswordlessSudo()
-                self.needsAdmin = !ok
+                self.recordResult(ok: ok, passwordless: passwordless, failText: "写入转速失败，请再试一次。")
             }
+        }
+    }
+
+    private func recordResult(ok: Bool, passwordless: Bool, failText: String) {
+        self.passwordless = passwordless
+        if ok {
+            needsAdmin = false
+            writeError = nil
+            return
+        }
+        if passwordless {
+            needsAdmin = false
+            writeError = failText
+        } else {
+            needsAdmin = true
+            writeError = nil
         }
     }
 

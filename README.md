@@ -1,6 +1,6 @@
 # OneBar
 
-macOS 菜单栏工具：内存、剪贴板、风扇（自动 / 固定转速）。
+macOS 菜单栏工具：内存、剪贴板、风扇（自动 / 固定转速 / 温度曲线）。
 
 ## 使用说明
 
@@ -18,14 +18,14 @@ curl -fsSL https://raw.githubusercontent.com/ai-evolution-lab/OneBar/master/Scri
 
 - **内存**：占用百分比与压力，点开看已用 / 应用 / 已联动 / 压缩 / 交换。
 - **剪贴板**：记录文本、图片、文件。点菜单栏图标或默认快捷键 **⌥⌘V** 弹出窗口；支持全部 / 文本 / 图片 / 文件 / 收藏筛选，点条目写回剪贴板后再 Cmd+V。历史在 `~/Library/Application Support/OneBar/`。
-- **风扇**：自动（交还系统）或固定转速（两颗风扇共用一个目标 RPM，超出各自上下限会钳位）。退出时尽量静默恢复自动。不要把转速长期锁死在过低值。请先退出 **Macs Fan Control**，否则会抢控制。
+- **风扇**：自动（交还系统）、固定转速（两颗风扇共用一个目标 RPM，超出各自上下限会钳位），或按 CPU 温度设置多条「≥ 某温度 → 某转速」条件。退出时尽量静默恢复自动。不要把转速长期锁死在过低值。请先退出 **Macs Fan Control**，否则会抢控制。
 
 ## 页面展示
 
 菜单栏从左到右大致是：`MEM 42%`、`FAN 48° 1800`、剪贴板 SF Symbol（`doc.on.clipboard`）。
 
 - **内存面板**：大号占用百分比、压力文案、若干用量行；底部「开机启动」和「退出」。
-- **风扇面板**：CPU / 最高温度、每颗风扇当前转速与上下限；「自动 / 固定转速」分段；固定时有滑杆和 RPM 输入；未授权时有「授权风扇控制（仅一次）」。
+- **风扇面板**：CPU / 最高温度、每颗风扇当前转速与上下限；「自动 / 固定 / 曲线」分段；固定时有滑杆和 RPM 输入；曲线可添加多条温度阈值；未授权时有「授权风扇控制（仅一次）」。
 - **剪贴板窗口**：深色列表，顶部可改快捷键、筛选胶囊、搜索框；图片有缩略图。
 
 ## 系统要求
@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/ai-evolution-lab/OneBar/master/Scri
 
 ## 权限
 
-第一次风扇授权会把当前用户、且仅 `/Applications/OneBar.app/Contents/MacOS/OneBar` 写入 `/etc/sudoers.d/onebar`。之后切换自动/固定不再要密码。App 必须放在 `/Applications/OneBar.app`，换位置后要再授权一次。
+第一次风扇授权会把当前用户、且仅 `/Applications/OneBar.app/Contents/MacOS/OneBar` 写入 `/etc/sudoers.d/onebar`。之后切换策略不再要密码。App 必须放在 `/Applications/OneBar.app`，换位置后要再授权一次。
 
 ## 许可
 

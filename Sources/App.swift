@@ -10,6 +10,9 @@ enum OneBarEntry {
         if args.count >= 2, args[1] == "helper" {
             exit(HelperCLI.run(args))
         }
+        if args.count >= 2, args[1] == "selftest" {
+            exit(FanCurve.runSelfTest())
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -200,7 +203,7 @@ private struct PanelChrome<Content: View>: View {
             .font(.caption)
         }
         .padding(14)
-        .frame(width: 320)
+        .frame(width: 340)
     }
 }
 
@@ -269,41 +272,31 @@ private struct FanPanel: View {
                 Picker("策略", selection: Binding(
                     get: { fan.mode },
                     set: { newValue in
-                        if newValue == .auto { fan.selectAuto() } else { fan.selectFixed() }
+                        switch newValue {
+                        case .auto: fan.selectAuto()
+                        case .fixed: fan.selectFixed()
+                        case .curve: fan.selectCurve()
+                        }
                     }
                 )) {
                     Text("自动").tag(FanMode.auto)
-                    Text("固定转速").tag(FanMode.fixed)
+                    Text("固定").tag(FanMode.fixed)
+                    Text("曲线").tag(FanMode.curve)
                 }
                 .pickerStyle(.segmented)
 
                 if fan.mode == .fixed {
-                    HStack {
-                        Slider(
-                            value: Binding(
-                                get: { fan.fixedRPM },
-                                set: { fan.fixedRPM = $0 }
-                            ),
-                            in: fan.sliderMin...max(fan.sliderMax, fan.sliderMin + 1),
-                            step: 50
-                        ) { editing in
-                            if !editing { fan.applyFixed() }
-                        }
-                        TextField("", value: $fan.fixedRPM, format: .number.precision(.fractionLength(0)))
-                            .frame(width: 64)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { fan.applyFixed() }
-                    }
-                    Text("两颗风扇共用这个目标，超出各自上下限时自动钳位。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    FixedSpeedControls(fan: fan)
+                }
+                if fan.mode == .curve {
+                    CurveControls(fan: fan)
                 }
 
                 if fan.applying {
                     Text("正在写入…").font(.caption).foregroundStyle(.secondary)
                 }
                 if fan.passwordless {
-                    Text("已授权，切换自动/固定不再要密码。")
+                    Text("已授权，切换策略不再要密码。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
@@ -322,8 +315,177 @@ private struct FanPanel: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                if let writeError = fan.writeError {
+                    Text(writeError)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
         }
+    }
+}
+
+private struct FixedSpeedControls: View {
+    @ObservedObject var fan: FanController
+    @State private var draft: Double = 0
+    @State private var dragging = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                RPMSlider(
+                    value: draft,
+                    minValue: fan.sliderMin,
+                    maxValue: max(fan.sliderMax, fan.sliderMin + 1),
+                    onLiveChange: { value in
+                        if !dragging {
+                            dragging = true
+                            fan.beginSpeedEdit()
+                        }
+                        draft = value
+                    },
+                    onEnded: { value in
+                        dragging = false
+                        draft = value
+                        fan.applyFixed(rpm: value)
+                    }
+                )
+                .frame(minHeight: 22)
+                TextField("", value: $draft, format: .number.precision(.fractionLength(0)))
+                    .frame(width: 64)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { fan.applyFixed(rpm: draft) }
+            }
+            Text("两颗风扇共用这个目标，超出各自上下限时自动钳位。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { draft = fan.fixedRPM }
+        .onChange(of: fan.fixedRPM) { _, newValue in
+            if !dragging { draft = newValue }
+        }
+    }
+}
+
+private struct CurveControls: View {
+    @ObservedObject var fan: FanController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(fan.curvePoints.sorted(by: { $0.celsius < $1.celsius })) { point in
+                HStack(spacing: 4) {
+                    Text("≥")
+                        .foregroundStyle(.secondary)
+                    TextField("", value: Binding(
+                        get: { point.celsius },
+                        set: { fan.updateCurvePoint(id: point.id, celsius: $0) }
+                    ), format: .number.precision(.fractionLength(0)))
+                    .frame(width: 40)
+                    .textFieldStyle(.roundedBorder)
+                    Text("°C")
+                        .foregroundStyle(.secondary)
+                    Text("→")
+                        .foregroundStyle(.secondary)
+                    TextField("", value: Binding(
+                        get: { point.rpm },
+                        set: { fan.updateCurvePoint(id: point.id, rpm: $0) }
+                    ), format: .number.precision(.fractionLength(0)))
+                    .frame(width: 56)
+                    .textFieldStyle(.roundedBorder)
+                    Text("RPM")
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button {
+                        fan.removeCurvePoint(point.id)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(fan.curvePoints.count <= 1)
+                    .foregroundStyle(fan.curvePoints.count <= 1 ? Color.secondary : Color.primary)
+                }
+                .font(.callout)
+            }
+            HStack {
+                Button("添加条件") { fan.addCurvePoint() }
+                    .disabled(fan.curvePoints.count >= 8)
+                Spacer()
+                Text(String(format: "当前 %.0f RPM", fan.curveTargetRPM))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            Text("按 CPU 温度匹配最高满足的条件；低于全部阈值时用最低转速。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Native NSSlider so dragging stays smooth inside an NSPopover (SwiftUI Slider re-renders every tick).
+private struct RPMSlider: NSViewRepresentable {
+    var value: Double
+    var minValue: Double
+    var maxValue: Double
+    var onLiveChange: (Double) -> Void
+    var onEnded: (Double) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onLiveChange: onLiveChange, onEnded: onEnded)
+    }
+
+    func makeNSView(context: Context) -> NSSlider {
+        let slider = TrackingSlider()
+        slider.minValue = minValue
+        slider.maxValue = maxValue
+        slider.doubleValue = value
+        slider.isContinuous = true
+        slider.target = context.coordinator
+        slider.action = #selector(Coordinator.changed(_:))
+        slider.onEnded = { [weak coordinator = context.coordinator] value in
+            coordinator?.ended(value)
+        }
+        return slider
+    }
+
+    func updateNSView(_ nsView: NSSlider, context: Context) {
+        context.coordinator.onLiveChange = onLiveChange
+        context.coordinator.onEnded = onEnded
+        if nsView.minValue != minValue { nsView.minValue = minValue }
+        if nsView.maxValue != maxValue { nsView.maxValue = maxValue }
+        if context.coordinator.dragging { return }
+        if abs(nsView.doubleValue - value) > 0.5 {
+            nsView.doubleValue = value
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var onLiveChange: (Double) -> Void
+        var onEnded: (Double) -> Void
+        var dragging = false
+
+        init(onLiveChange: @escaping (Double) -> Void, onEnded: @escaping (Double) -> Void) {
+            self.onLiveChange = onLiveChange
+            self.onEnded = onEnded
+        }
+
+        @objc func changed(_ sender: NSSlider) {
+            dragging = true
+            onLiveChange(sender.doubleValue.rounded())
+        }
+
+        func ended(_ value: Double) {
+            dragging = false
+            onEnded(value.rounded())
+        }
+    }
+}
+
+private final class TrackingSlider: NSSlider {
+    var onEnded: ((Double) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        onEnded?(doubleValue)
     }
 }
 
