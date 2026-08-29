@@ -108,6 +108,30 @@ struct ClipboardRootView: View {
                 }
                 .buttonStyle(.plain)
                 .help("点击后按下新的快捷键")
+                Menu {
+                    Picker("保留策略", selection: Binding(
+                        get: { clipboard.retention },
+                        set: { clipboard.setRetention($0) }
+                    )) {
+                        ForEach(RetentionPolicy.allCases) { policy in
+                            Text(policy.title).tag(policy)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(clipboard.retention.title)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.08), in: Capsule())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("历史保留时长，收藏条目不会过期")
                 Button("清空") { clipboard.clear() }
                     .font(.caption)
                     .buttonStyle(.plain)

@@ -65,18 +65,47 @@ struct ClipboardItem: Identifiable, Equatable {
     }
 }
 
+/// 保留策略：按时间清理历史，收藏条目豁免。
+enum RetentionPolicy: String, CaseIterable, Identifiable {
+    case today, oneMonth, threeMonths, halfYear, forever
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .today: return "仅保留当天"
+        case .oneMonth: return "保留 1 个月"
+        case .threeMonths: return "保留 3 个月"
+        case .halfYear: return "保留半年"
+        case .forever: return "永久保留"
+        }
+    }
+
+    var cutoff: Date? {
+        let calendar = Calendar.current
+        let now = Date()
+        switch self {
+        case .today: return calendar.startOfDay(for: now)
+        case .oneMonth: return calendar.date(byAdding: .day, value: -30, to: now)
+        case .threeMonths: return calendar.date(byAdding: .day, value: -90, to: now)
+        case .halfYear: return calendar.date(byAdding: .day, value: -180, to: now)
+        case .forever: return nil
+        }
+    }
+}
+
 @MainActor
 final class ClipboardStore: ObservableObject {
     @Published var items: [ClipboardItem] = []
     @Published var hotKey: HotKeySpec
     @Published var recordingHotKey = false
+    @Published var retention: RetentionPolicy
 
     private let pasteboard = NSPasteboard.general
     private var changeCount: Int
     private var ignoreUntilCount: Int?
     private var timer: Timer?
+    private var cleanupTimer: Timer?
     private var keyMonitor: Any?
-    private let limit = 80
     private let root: URL
     private let imagesDir: URL
     private let indexURL: URL
@@ -108,10 +137,41 @@ final class ClipboardStore: ObservableObject {
             hotKey = .defaultClip
         }
 
+        let storedRetention = UserDefaults.standard.string(forKey: "onebar.clip.retention")
+        retention = storedRetention.flatMap { RetentionPolicy(rawValue: $0) } ?? .threeMonths
+
         load()
+        applyRetention()
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.applyRetention() }
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.poll() }
         }
+    }
+
+    func setRetention(_ policy: RetentionPolicy) {
+        guard policy != retention else { return }
+        retention = policy
+        UserDefaults.standard.set(policy.rawValue, forKey: "onebar.clip.retention")
+        applyRetention()
+    }
+
+    func applyRetention() {
+        guard let cutoff = retention.cutoff else { return }
+        let expired = items.filter { !$0.isFavorite && $0.createdAt < cutoff }
+        guard !expired.isEmpty else { return }
+        let expiredIDs = Set(expired.map(\.id))
+        items.removeAll { expiredIDs.contains($0.id) }
+        for item in expired {
+            if let path = item.imagePath {
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
+            }
+            if let path = item.thumbPath {
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
+            }
+        }
+        persist()
     }
 
     func persistHotKey() {
@@ -266,15 +326,6 @@ final class ClipboardStore: ObservableObject {
 
     private func prepend(_ item: ClipboardItem) {
         items.insert(item, at: 0)
-        while items.count > limit {
-            let removed = items.removeLast()
-            if let path = removed.imagePath {
-                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
-            }
-            if let path = removed.thumbPath {
-                try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
-            }
-        }
         persist()
     }
 
