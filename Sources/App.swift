@@ -13,6 +13,12 @@ enum OneBarEntry {
         if args.count >= 2, args[1] == "selftest" {
             exit(FanCurve.runSelfTest())
         }
+        if args.count >= 2, args[1] == "snapshot" {
+            exit(Snapshotter.run(outputDir: args.count >= 3 ? args[2] : NSTemporaryDirectory()))
+        }
+        if args.count >= 2, args[1] == "snapshot-popover" {
+            exit(Snapshotter.runPopover(outputDir: args.count >= 3 ? args[2] : NSTemporaryDirectory()))
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -95,11 +101,25 @@ final class StatusBarController: NSObject {
     }
 
     private func embed<V: View>(_ view: V, in popover: NSPopover) {
-        let host = NSHostingController(rootView: view)
-        host.sizingOptions = [.intrinsicContentSize]
-        popover.contentViewController = host
+        popover.contentViewController = Self.makePanelHost(view)
         popover.behavior = .transient
         popover.animates = false
+    }
+
+    /// `.preferredContentSize` (not `.intrinsicContentSize`) is what NSPopover actually
+    /// sizes itself from; with the wrong option the popover keeps a stale size and the
+    /// panel gets clipped at the popover edges.
+    static func makePanelHost<V: View>(_ view: V) -> NSHostingController<V> {
+        let host = NSHostingController(rootView: view)
+        host.sizingOptions = [.preferredContentSize]
+        return host
+    }
+
+    /// Popovers only adopt the content size at show time; make sure it matches the panel.
+    private func syncPopoverSize(_ popover: NSPopover) {
+        guard let view = popover.contentViewController?.view else { return }
+        let fitting = view.fittingSize
+        if fitting.width > 1, fitting.height > 1 { popover.contentSize = fitting }
     }
 
     private func refreshTitles() {
@@ -122,16 +142,21 @@ final class StatusBarController: NSObject {
         clipWindow?.hide()
         guard !wasOpen, let button = item.button else { return }
         if popover == fanPopover { state.fan.clearTransientFeedback() }
+        syncPopoverSize(popover)
         button.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        if let window = popover.contentViewController?.view.window {
+            window.makeKey()
+            window.makeFirstResponder(nil)
+        }
     }
 }
 
 @MainActor
 final class AppState: ObservableObject {
     @Published var memory = MemorySnapshot.zero
+    @Published var memoryTop: [ProcessMemoryEntry] = []
     @Published var launchAtLogin: Bool
     let clipboard = ClipboardStore()
     let fan = FanController()
@@ -139,6 +164,7 @@ final class AppState: ObservableObject {
 
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
+    private var tickCount = 0
 
     init() {
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -151,10 +177,22 @@ final class AppState: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        refreshMemoryTop()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.memory = MemorySampler.sample()
+                guard let self else { return }
+                self.memory = MemorySampler.sample()
+                self.tickCount += 1
+                if self.tickCount % 3 == 0 { self.refreshMemoryTop() }
             }
+        }
+    }
+
+    /// Per-process sampling walks every PID; do it off-main and at a slower cadence.
+    private func refreshMemoryTop() {
+        Task.detached(priority: .utility) {
+            let top = MemorySampler.topProcesses(limit: 10)
+            await MainActor.run { [weak self] in self?.memoryTop = top }
         }
     }
 
@@ -182,15 +220,21 @@ final class AppState: ObservableObject {
 }
 
 private struct PanelChrome<Content: View>: View {
-    let title: String
+    var viewportHeight: CGFloat
     @ViewBuilder var content: Content
     @EnvironmentObject var state: AppState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.headline)
-            content
+        VStack(spacing: 0) {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 12) {
+                    content
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: viewportHeight)
+            .scrollBounceBehavior(.basedOnSize)
             Divider()
             HStack {
                 Toggle("开机启动", isOn: Binding(
@@ -208,38 +252,130 @@ private struct PanelChrome<Content: View>: View {
                 .controlSize(.small)
             }
             .font(.caption)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
-        .padding(14)
-        .frame(width: 340)
+        .frame(width: 360)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
 private struct MemoryPanel: View {
     @EnvironmentObject var state: AppState
 
+    /// Matches MemoryPanelContent's natural height + its 14pt paddings, so the
+    /// fixed viewport hugs the content without a dead gap under the last card.
+    static let viewportHeight: CGFloat = MemoryPanelContent.height + 28
+
     var body: some View {
-        PanelChrome(title: "内存") {
-            let mem = state.memory
-            HStack(alignment: .firstTextBaseline) {
-                Text(String(format: "%.0f%%", mem.usedPercent))
-                    .font(.system(size: 32, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
+        PanelChrome(viewportHeight: Self.viewportHeight) {
+            MemoryPanelContent()
+        }
+    }
+}
+
+private struct MemoryPanelContent: View {
+    @EnvironmentObject var state: AppState
+
+    /// Measured natural height of the layout below (header card + usage card +
+    /// Top 10 card + gaps). Update together with the rows below.
+    static let height: CGFloat = 517
+
+    var body: some View {
+        let mem = state.memory
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center) {
+                HStack(alignment: .firstTextBaseline, spacing: 2) {
+                    Text(String(format: "%.0f", mem.usedPercent))
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                    Text("%")
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
-                Label(mem.pressure.title, systemImage: mem.pressure == .normal ? "checkmark.circle" : "exclamationmark.triangle")
-                    .font(.caption)
+                Label(mem.pressure.title, systemImage: mem.pressure == .normal ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(mem.pressure == .normal ? Color.secondary : Color.orange)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        (mem.pressure == .normal ? Color.secondary : Color.orange).opacity(0.12),
+                        in: Capsule()
+                    )
             }
-            VStack(spacing: 5) {
+            VStack(spacing: 0) {
                 row("已用", bytes: mem.usedBytes, total: mem.totalBytes)
+                divider
                 row("应用", bytes: mem.appBytes)
+                divider
                 row("已联动", bytes: mem.wiredBytes)
+                divider
                 row("压缩", bytes: mem.compressedBytes)
+                divider
                 row("交换", bytes: mem.swapUsedBytes)
             }
-            .padding(.vertical, 9)
-            .padding(.horizontal, 11)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+            topProcessesCard
         }
+    }
+
+    /// Top consumers by phys_footprint — same metric as Activity Monitor's 内存 column.
+    private var topProcessesCard: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("进程占用 Top 10")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("物理占用")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            divider
+            if state.memoryTop.isEmpty {
+                Text("正在统计…")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(state.memoryTop.enumerated()), id: \.element.id) { index, entry in
+                        if index > 0 { divider }
+                        processRow(rank: index + 1, entry: entry)
+                    }
+                }
+            }
+        }
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func processRow(rank: Int, entry: ProcessMemoryEntry) -> some View {
+        HStack(spacing: 8) {
+            Text("\(rank)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+                .frame(width: 16, alignment: .center)
+            Text(entry.name)
+                .font(.system(size: 13))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Text(formatBytes(entry.bytes))
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.primary.opacity(0.85))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+    }
+
+    private var divider: some View {
+        Divider().overlay(Color.primary.opacity(0.06))
     }
 
     private func row(_ title: String, bytes: UInt64, total: UInt64? = nil) -> some View {
@@ -255,6 +391,8 @@ private struct MemoryPanel: View {
         .font(.callout)
         .monospacedDigit()
         .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
     }
 }
 
@@ -263,65 +401,102 @@ private struct FanPanel: View {
     @EnvironmentObject var fan: FanController
 
     var body: some View {
-        PanelChrome(title: "风扇") {
+        PanelChrome(viewportHeight: 470) {
             if let error = fan.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.callout)
-                    .foregroundStyle(.red)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    tempHeader
-                    fanCard
-                    strategyPicker
-                    modeControls
-                    statusFootnotes
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.callout)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 40)
+            } else {
+                tempHeader
+                fanCard
+                strategyPicker
+                modeControls
+                statusFootnotes
             }
         }
     }
 
     private var tempHeader: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(fan.cpuTemp.map { String(format: "%.0f", $0) } ?? "--")
-                .font(.system(size: 32, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-            Text("°C")
-                .font(.system(size: 15, weight: .medium, design: .rounded))
-                .foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(fan.cpuTemp.map { String(format: "%.0f", $0) } ?? "--")
+                    .font(.system(size: 36, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                Text("°C")
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
             Text("CPU")
-                .font(.caption)
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
             Spacer()
-            Text(fan.hottestTemp.map { String(format: "最高 %.0f°C", $0) } ?? "")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("全机最高")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(fan.hottestTemp.map { String(format: "%.0f°C", $0) } ?? "--")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity)
+        .background(
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.16), Color.accentColor.opacity(0.05)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.primary.opacity(0.07))
+        )
     }
 
     private var fanCard: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 0) {
             ForEach(fan.fans) { item in
-                HStack(spacing: 10) {
-                    Circle()
-                        .fill(item.isManual ? Color.accentColor : Color.secondary.opacity(0.35))
-                        .frame(width: 7, height: 7)
-                    Text("风扇 \(item.id)")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(String(format: "%.0f", item.actualRPM))
-                        .font(.system(.body, design: .monospaced).weight(.medium))
-                        .frame(width: 54, alignment: .trailing)
-                    Text(String(format: "%.0f–%.0f", item.minRPM, item.maxRPM))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 92, alignment: .trailing)
+                fanRow(item)
+                if item.id != fan.fans.count - 1 {
+                    Divider().overlay(Color.primary.opacity(0.06))
                 }
             }
         }
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func fanRow(_ item: FanInfo) -> some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(item.isManual ? Color.accentColor : Color.secondary.opacity(0.35))
+                .frame(width: 7, height: 7)
+            Text("风扇 \(item.id)")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(String(format: "%.0f", item.actualRPM))
+                .font(.system(.callout, design: .monospaced).weight(.semibold))
+                .monospacedDigit()
+                .frame(width: 50, alignment: .trailing)
+            Text(String(format: "%.0f–%.0f", item.minRPM, item.maxRPM))
+                .font(.system(size: 11, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 90, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
         .padding(.vertical, 9)
-        .padding(.horizontal, 11)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var strategyPicker: some View {
@@ -345,6 +520,7 @@ private struct FanPanel: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -433,10 +609,20 @@ private struct FixedSpeedControls: View {
                 )
                 .frame(minHeight: 22)
                 TextField("", text: $rpmText)
+                    .textFieldStyle(.plain)
                     .font(.system(.callout, design: .monospaced))
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 60)
-                    .textFieldStyle(.roundedBorder)
+                    .monospacedDigit()
+                    .multilineTextAlignment(.center)
+                    .frame(width: 66)
+                    .padding(.vertical, 4)
+                    .background(
+                        Color.primary.opacity(fieldFocused ? 0.1 : 0.07),
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(fieldFocused ? Color.accentColor.opacity(0.8) : Color.primary.opacity(0.06))
+                    )
                     .focused($fieldFocused)
                     .onSubmit { commitText() }
                     .onChange(of: fieldFocused) { _, focused in
@@ -479,13 +665,12 @@ private struct CurveControls: View {
     @ObservedObject var fan: FanController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(spacing: 7) {
                 ForEach(fan.curvePoints.sorted(by: { $0.celsius < $1.celsius })) { point in
                     CurveRow(fan: fan, point: point)
                 }
             }
-            .padding(.vertical, 4)
             HStack {
                 Button {
                     fan.addCurvePoint()
@@ -499,14 +684,14 @@ private struct CurveControls: View {
                 .opacity(fan.curvePoints.count >= 8 ? 0.4 : 1)
                 Spacer()
                 Text(String(format: "%.0f RPM", fan.curveTargetRPM))
-                    .font(.caption.weight(.medium))
+                    .font(.caption.weight(.semibold))
                     .monospacedDigit()
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.14), in: Capsule())
                     .foregroundStyle(Color.accentColor)
             }
-            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速；降档需温度低于当前档位阈值 2.5°C，避免转速反复跳变。")
+            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -529,49 +714,38 @@ private struct CurveRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             Text("≥")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .frame(width: 12)
-            TextField("", text: $celsiusDraft)
-                .font(.system(.callout, design: .monospaced))
-                .multilineTextAlignment(.trailing)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 42)
-                .focused($focusedField, equals: .celsius)
-                .onSubmit { commitCelsius() }
+                .frame(width: 14)
+            field($celsiusDraft, width: 46, kind: .celsius, commit: commitCelsius)
             Text("°C")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 22, alignment: .leading)
+                .frame(width: 20, alignment: .leading)
             Text("→")
                 .font(.callout)
-                .foregroundStyle(.tertiary)
-                .frame(width: 12)
-            TextField("", text: $rpmDraft)
-                .font(.system(.callout, design: .monospaced))
-                .multilineTextAlignment(.trailing)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 58)
-                .focused($focusedField, equals: .rpm)
-                .onSubmit { commitRPM() }
+                .foregroundStyle(Color.secondary.opacity(0.5))
+                .frame(width: 14)
+            field($rpmDraft, width: 66, kind: .rpm, commit: commitRPM)
             Text("RPM")
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 28, alignment: .leading)
+                .frame(width: 30, alignment: .leading)
             Spacer(minLength: 4)
             Button {
                 fan.removeCurvePoint(point.id)
             } label: {
                 Image(systemName: "minus.circle.fill")
+                    .font(.system(size: 16))
             }
             .buttonStyle(.plain)
             .disabled(fan.curvePoints.count <= 1)
             .foregroundStyle(
                 fan.curvePoints.count <= 1
-                    ? Color.secondary.opacity(0.3)
-                    : Color.secondary.opacity(0.7)
+                    ? Color.secondary.opacity(0.25)
+                    : Color.secondary.opacity(0.6)
             )
         }
         .onAppear { syncDrafts() }
@@ -585,6 +759,32 @@ private struct CurveRow: View {
                 commitAll()
             }
         }
+    }
+
+    private func field(
+        _ text: Binding<String>,
+        width: CGFloat,
+        kind: Field,
+        commit: @escaping () -> Void
+    ) -> some View {
+        let focused = focusedField == kind
+        return TextField("", text: text)
+            .textFieldStyle(.plain)
+            .font(.system(.callout, design: .monospaced))
+            .monospacedDigit()
+            .multilineTextAlignment(.center)
+            .focused($focusedField, equals: kind)
+            .onSubmit { commit() }
+            .frame(width: width)
+            .padding(.vertical, 5)
+            .background(
+                Color.primary.opacity(focused ? 0.1 : 0.07),
+                in: RoundedRectangle(cornerRadius: 6)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(focused ? Color.accentColor.opacity(0.8) : Color.primary.opacity(0.06))
+            )
     }
 
     private func syncDrafts() {
@@ -690,4 +890,136 @@ private func formatBytes(_ bytes: UInt64) -> String {
     formatter.countStyle = .memory
     formatter.allowedUnits = [.useMB, .useGB]
     return formatter.string(fromByteCount: Int64(bytes))
+}
+
+/// Dev-only: `OneBar snapshot <dir>` renders the real panels into windows and saves PNGs,
+/// so layout can be inspected without popping the actual NSPopover.
+private enum Snapshotter {
+    @MainActor
+    static func run(outputDir: String) -> Int32 {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let state = AppState()
+
+        func makeWindow(_ view: some View, x: CGFloat) -> NSWindow {
+            let window = NSWindow(
+                contentRect: NSRect(x: x, y: 200, width: 380, height: 640),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            let host = NSHostingController(rootView: view)
+            host.sizingOptions = [.intrinsicContentSize]
+            window.contentViewController = host
+            window.title = "OneBar Snapshot"
+            window.makeKeyAndOrderFront(nil)
+            let fitting = host.view.fittingSize
+            window.setContentSize(fitting)
+            window.setFrameTopLeftPoint(NSPoint(x: x, y: 760))
+            return window
+        }
+
+        let fanWindow = makeWindow(
+            FanPanel().environmentObject(state).environmentObject(state.fan),
+            x: 80
+        )
+        let memoryWindow = makeWindow(
+            MemoryPanel().environmentObject(state),
+            x: 520
+        )
+        let clipboardWindow = makeWindow(
+            ClipboardRootView()
+                .environmentObject(state)
+                .environmentObject(state.clipboard),
+            x: 960
+        )
+
+        // Give the first SMC tick time to fill temps, then walk through modes.
+        spin(seconds: 3)
+        let dir = URL(fileURLWithPath: outputDir, isDirectory: true)
+        capture(fanWindow, to: dir.appendingPathComponent("fan-curve.png"))
+
+        let savedMode = state.fan.mode
+        state.fan.curvePoints = (0..<8).map {
+            FanCurvePoint(celsius: Double(45 + $0 * 8), rpm: 2000 + Double($0) * 600)
+        }
+        state.fan.mode = .curve
+        spin(seconds: 0.8)
+        capture(fanWindow, to: dir.appendingPathComponent("fan-curve-8.png"))
+
+        state.fan.mode = .fixed
+        spin(seconds: 0.5)
+        capture(fanWindow, to: dir.appendingPathComponent("fan-fixed.png"))
+
+        capture(memoryWindow, to: dir.appendingPathComponent("memory.png"))
+        capture(clipboardWindow, to: dir.appendingPathComponent("clipboard.png"))
+        state.fan.mode = savedMode
+        state.fan.restoreAutoOnQuit()
+        return 0
+    }
+
+    private static func spin(seconds: TimeInterval) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    private static func capture(_ window: NSWindow, to url: URL) {
+        guard let image = CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.windowNumber),
+            [.bestResolution]
+        ) else { return }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        try? data.write(to: url)
+    }
+
+    /// Shows the real NSPopover (same embed path as the status bar item) and captures it.
+    @MainActor
+    static func runPopover(outputDir: String) -> Int32 {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let state = AppState()
+
+        let anchorWindow = NSWindow(
+            contentRect: NSRect(x: 400, y: 260, width: 320, height: 100),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let anchor = NSButton(frame: NSRect(x: 24, y: 48, width: 90, height: 28))
+        anchor.title = "FAN 62°"
+        anchorWindow.contentView?.addSubview(anchor)
+        anchorWindow.title = "OneBar Popover Snapshot"
+        anchorWindow.makeKeyAndOrderFront(nil)
+        app.activate(ignoringOtherApps: true)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = false
+        popover.contentViewController = StatusBarController.makePanelHost(
+            FanPanel().environmentObject(state).environmentObject(state.fan)
+        )
+        if let view = popover.contentViewController?.view {
+            let fitting = view.fittingSize
+            if fitting.width > 1, fitting.height > 1 { popover.contentSize = fitting }
+        }
+        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        if let window = popover.contentViewController?.view.window {
+            window.makeKey()
+            window.makeFirstResponder(nil)
+        }
+
+        spin(seconds: 3)
+        let dir = URL(fileURLWithPath: outputDir, isDirectory: true)
+        if let window = popover.contentViewController?.view.window {
+            capture(window, to: dir.appendingPathComponent("popover-fan.png"))
+        }
+        popover.performClose(nil)
+        state.fan.restoreAutoOnQuit()
+        return 0
+    }
 }

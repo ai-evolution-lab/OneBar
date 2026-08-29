@@ -36,8 +36,8 @@ final class ThumbnailCache: @unchecked Sendable {
     private let queue = DispatchQueue(label: "onebar.thumb", qos: .userInitiated)
 
     init() {
-        cache.countLimit = 80
-        cache.totalCostLimit = 16 * 1024 * 1024
+        cache.countLimit = 300
+        cache.totalCostLimit = 48 * 1024 * 1024
     }
 
     func image(for path: String) async -> NSImage? {
@@ -48,12 +48,15 @@ final class ThumbnailCache: @unchecked Sendable {
                 let url = URL(fileURLWithPath: path)
                 let srcURL = url as CFURL
                 let image: NSImage?
+                // Rows show ~80pt tall; 220px keeps 2x displays sharp without decoding
+                // huge originals. Decode NOW on this queue — deferring it means the
+                // first draw stutters the main thread mid-scroll.
                 if let source = CGImageSourceCreateWithURL(srcURL, [kCGImageSourceShouldCache: false] as CFDictionary) {
                     let options: [CFString: Any] = [
                         kCGImageSourceCreateThumbnailFromImageAlways: true,
                         kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceThumbnailMaxPixelSize: 360,
-                        kCGImageSourceShouldCacheImmediately: false
+                        kCGImageSourceThumbnailMaxPixelSize: 220,
+                        kCGImageSourceShouldCacheImmediately: true
                     ]
                     if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
                         image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
@@ -64,7 +67,8 @@ final class ThumbnailCache: @unchecked Sendable {
                     image = nil
                 }
                 if let image {
-                    self.cache.setObject(image, forKey: path as NSString, cost: Int(image.size.width * image.size.height))
+                    let cost = Int(image.size.width * image.size.height * 4)
+                    self.cache.setObject(image, forKey: path as NSString, cost: cost)
                 }
                 cont.resume(returning: image)
             }

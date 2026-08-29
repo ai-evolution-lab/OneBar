@@ -1,6 +1,10 @@
 import SwiftUI
 import AppKit
 
+private extension Notification.Name {
+    static let clipboardWindowDidShow = Notification.Name("onebar.clipboardWindowDidShow")
+}
+
 enum ClipboardFilter: String, CaseIterable, Identifiable {
     case all, text, image, file, favorite
     var id: String { rawValue }
@@ -34,37 +38,46 @@ struct ClipboardRootView: View {
     @State private var selectedID: UUID?
 
     var body: some View {
+        let items = filtered
         VStack(spacing: 0) {
             header
             Divider().opacity(0.25)
-            if filtered.isEmpty {
+            if items.isEmpty {
                 emptyState
             } else {
-                List(Array(filtered.enumerated()), id: \.element.id) { index, item in
-                    ClipboardRow(
-                        index: index + 1,
-                        item: item,
-                        selected: selectedID == item.id
-                    ) {
-                        selectedID = item.id
-                        clipboard.restore(item)
-                        state.hideClipboard()
-                    } onCopy: {
-                        clipboard.restore(item)
-                    } onDelete: {
-                        clipboard.remove(item)
-                    } onFavorite: {
-                        clipboard.toggleFavorite(item)
+                ScrollViewReader { proxy in
+                    List(Array(items.enumerated()), id: \.element.id) { index, item in
+                        ClipboardRow(
+                            index: index + 1,
+                            item: item,
+                            selected: selectedID == item.id
+                        ) {
+                            selectedID = item.id
+                            clipboard.restore(item)
+                            state.hideClipboard()
+                        } onCopy: {
+                            clipboard.restore(item)
+                        } onDelete: {
+                            clipboard.remove(item)
+                        } onFavorite: {
+                            clipboard.toggleFavorite(item)
+                        }
+                        .onTapGesture {
+                            selectedID = item.id
+                        }
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .id(item.id)
                     }
-                    .onTapGesture {
-                        selectedID = item.id
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .onReceive(NotificationCenter.default.publisher(for: .clipboardWindowDidShow)) { _ in
+                        guard let first = filtered.first?.id else { return }
+                        selectedID = first
+                        proxy.scrollTo(first, anchor: .top)
                     }
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
             }
         }
         .frame(minWidth: 420, minHeight: 560)
@@ -82,7 +95,7 @@ struct ClipboardRootView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("剪贴板")
-                    .font(.headline)
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
                 Spacer()
                 Button {
                     clipboard.beginRecordHotKey()
@@ -117,12 +130,19 @@ struct ClipboardRootView: View {
             }
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                 TextField("搜索", text: $query)
                     .textFieldStyle(.plain)
+                    .font(.callout)
             }
-            .padding(8)
-            .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.white.opacity(0.06))
+            )
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
@@ -170,13 +190,16 @@ private struct ClipboardRow: View {
     let onDelete: () -> Void
     let onFavorite: () -> Void
     @State private var hovered = false
+    @State private var copied = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Text("\(index)")
-                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
                 .foregroundStyle(.white.opacity(0.22))
-                .frame(width: 28, alignment: .trailing)
+                .frame(width: 38, alignment: .trailing)
             Button(action: onRestore) {
                 Image(systemName: "arrow.uturn.backward")
                     .font(.system(size: 11, weight: .bold))
@@ -209,11 +232,20 @@ private struct ClipboardRow: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    Button(action: onCopy) {
-                        Image(systemName: "square.on.square")
+                    Button {
+                        onCopy()
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                            copied = false
+                        }
+                    } label: {
+                        Image(systemName: copied ? "checkmark" : "square.on.square")
+                            .foregroundStyle(copied ? Color.green : Color.secondary)
+                            .scaleEffect(copied ? 1.15 : 1.0)
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+                    .animation(.easeInOut(duration: 0.15), value: copied)
+                    .help("复制到剪贴板")
                 }
                 if let path = item.previewSourcePath {
                     ThumbnailView(path: path)
@@ -234,7 +266,11 @@ private struct ClipboardRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(selected ? Color(red: 0.45, green: 0.82, blue: 0.42).opacity(0.85) : Color.clear)
+        .background(
+            selected ? Color.white.opacity(0.10) : hovered ? Color.white.opacity(0.05) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 10)
+        )
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
     }
@@ -301,6 +337,7 @@ final class ClipboardWindowController: NSObject, NSWindowDelegate {
         centerOnScreen()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        NotificationCenter.default.post(name: .clipboardWindowDidShow, object: nil)
     }
 
     func hide() {

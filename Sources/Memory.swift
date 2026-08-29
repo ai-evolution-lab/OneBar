@@ -92,3 +92,52 @@ enum MemorySampler {
         )
     }
 }
+
+struct ProcessMemoryEntry: Identifiable, Equatable {
+    let pid: Int
+    let name: String
+    let bytes: UInt64
+
+    var id: Int { pid }
+}
+
+extension MemorySampler {
+    /// Top processes by phys_footprint — the same metric Activity Monitor's 内存 column
+    /// shows. proc_pid_rusage needs no root and covers other users' processes.
+    static func topProcesses(limit: Int = 10) -> [ProcessMemoryEntry] {
+        let hint = proc_listallpids(nil, 0)
+        guard hint > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(hint) + 64)
+        let count = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        guard count > 0 else { return [] }
+        var entries: [ProcessMemoryEntry] = []
+        entries.reserveCapacity(Int(count))
+        for pid in pids.prefix(Int(count)) where pid > 0 {
+            var usage = rusage_info_current()
+            let ok = withUnsafeMutablePointer(to: &usage) { pointer in
+                pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                    proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0) == 0
+                }
+            }
+            guard ok else { continue }
+            let footprint = usage.ri_phys_footprint
+            guard footprint > 16 * 1024 * 1024 else { continue }
+            entries.append(ProcessMemoryEntry(pid: Int(pid), name: processName(pid: pid), bytes: footprint))
+        }
+        return Array(entries.sorted { $0.bytes > $1.bytes }.prefix(limit))
+    }
+
+    private static func processName(pid: pid_t) -> String {
+        var path = [CChar](repeating: 0, count: 2 * Int(MAXPATHLEN))
+        if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
+            let file = URL(fileURLWithPath: String(cString: path)).lastPathComponent
+            if !file.isEmpty { return file }
+        }
+        var name = [CChar](repeating: 0, count: 256)
+        if proc_name(pid, &name, UInt32(name.count)) > 0 {
+            let trimmed = String(cString: name).trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return "PID \(pid)"
+    }
+}
