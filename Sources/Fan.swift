@@ -77,6 +77,17 @@ enum PrivilegedWriter {
         Bundle.main.executablePath ?? CommandLine.arguments[0]
     }
 
+    /// Serialize every sudo helper run: two concurrent root SMC writers make writes fail intermittently.
+    private static let queue = DispatchQueue(label: "onebar.fan.helper")
+    private static let logURL = FileManager.default
+        .urls(for: .libraryDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("Logs/OneBar-fan.log")
+
+    struct Outcome {
+        var ok: Bool
+        var detail: String
+    }
+
     static func hasPasswordlessSudo() -> Bool {
         let result = runProcess("/usr/bin/sudo", ["-n", executablePath, "helper"])
         let err = result.stderr.lowercased()
@@ -92,11 +103,11 @@ enum PrivilegedWriter {
         return hasPasswordlessSudo()
     }
 
-    static func setAllFixed(rpm: Double, promptIfNeeded: Bool = true) -> Bool {
+    static func setAllFixed(rpm: Double, promptIfNeeded: Bool = true) -> Outcome {
         runHelper(["all", String(format: "%.0f", rpm)], promptIfNeeded: promptIfNeeded)
     }
 
-    static func setAllAuto(promptIfNeeded: Bool = true) -> Bool {
+    static func setAllAuto(promptIfNeeded: Bool = true) -> Outcome {
         runHelper(["all", "auto"], promptIfNeeded: promptIfNeeded)
     }
 
@@ -104,13 +115,36 @@ enum PrivilegedWriter {
         _ = runProcess("/usr/bin/sudo", ["-n", executablePath, "helper", "all", "auto"])
     }
 
-    private static func runHelper(_ helperArgs: [String], promptIfNeeded: Bool) -> Bool {
-        if promptIfNeeded {
-            guard ensureAuthorized() else { return false }
-        } else if !hasPasswordlessSudo() {
-            return false
+    private static func appendLog(_ line: String) {
+        guard let logURL else { return }
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let entry = "[\(stamp)] \(line)\n"
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(entry.utf8))
+        } else {
+            try? Data(entry.utf8).write(to: logURL, options: .atomic)
         }
-        return runProcess("/usr/bin/sudo", ["-n", executablePath, "helper"] + helperArgs).status == 0
+    }
+
+    private static func runHelper(_ helperArgs: [String], promptIfNeeded: Bool) -> Outcome {
+        if promptIfNeeded {
+            guard ensureAuthorized() else { return Outcome(ok: false, detail: "未授权") }
+        } else if !hasPasswordlessSudo() {
+            return Outcome(ok: false, detail: "未授权")
+        }
+        let result = queue.sync {
+            runProcess("/usr/bin/sudo", ["-n", executablePath, "helper"] + helperArgs)
+        }
+        if result.status == 0 { return Outcome(ok: true, detail: "") }
+        appendLog("helper \(helperArgs.joined(separator: " ")) -> status \(result.status.map(String.init) ?? "nil"): \(result.stderr)")
+        let detail = result.stderr
+            .split(separator: "\n")
+            .filter { !$0.localizedCaseInsensitiveContains("usage") }
+            .joined(separator: " / ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Outcome(ok: false, detail: String(detail.prefix(100)))
     }
 
     /// One-time: write /etc/sudoers.d/onebar so later fan switches use `sudo -n`.
@@ -169,6 +203,10 @@ enum HelperCLI {
         defer { smc.close() }
 
         let count = Int(smc.readDouble("FNum") ?? 0)
+        guard count > 0 else {
+            fputs("OneBar: SMC reports no fans\n", stderr)
+            return 1
+        }
         let target = argv[2]
         let indices: [Int]
         if target == "all" {
@@ -183,7 +221,10 @@ enum HelperCLI {
         if argv[3] == "auto" {
             var ok = true
             for i in indices {
-                if !releaseToAuto(smc, fanIndex: i) { ok = false }
+                if !releaseToAuto(smc, fanIndex: i) {
+                    fputs("OneBar: failed to release fan \(i) to auto\n", stderr)
+                    ok = false
+                }
             }
             if smc.keyInfo("Ftst") != nil {
                 _ = smc.writeDouble("Ftst", value: 0)
@@ -218,7 +259,10 @@ enum HelperCLI {
                 if let after = smc.readDouble(key), abs(after - clamped) < 2 { break }
                 usleep(150_000)
             }
-            if !accepted { ok = false }
+            if !accepted {
+                fputs("OneBar: SMC rejected write to \(key)\n", stderr)
+                ok = false
+            }
         }
         return ok ? 0 : 1
     }
@@ -236,15 +280,13 @@ enum HelperCLI {
     private static func setManual(_ smc: SMC, fanIndex: Int) -> Bool {
         guard let mk = modeKey(smc, fanIndex: fanIndex) else { return true }
         if smc.readUInt8(mk) == 1 { return true }
-        _ = smc.writeDouble(mk, value: 1)
-        if smc.readUInt8(mk) == 1 { return true }
-        guard smc.keyInfo("Ftst") != nil else { return false }
-        _ = smc.writeDouble("Ftst", value: 1)
-        let deadline = Date().addingTimeInterval(8)
+        let hasTst = smc.keyInfo("Ftst") != nil
+        let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             _ = smc.writeDouble(mk, value: 1)
+            if hasTst { _ = smc.writeDouble("Ftst", value: 1) }
             if smc.readUInt8(mk) == 1 { return true }
-            usleep(100_000)
+            usleep(120_000)
         }
         return smc.readUInt8(mk) == 1
     }
@@ -299,6 +341,9 @@ final class FanController: ObservableObject {
     private var lastReapply = Date.distantPast
     private var lastAppliedRPM: Double?
     private var applyGeneration = 0
+    private var writeInFlightGeneration: Int?
+    private var readFailStreak = 0
+    private var lastSilentCurveApply = Date.distantPast
     private var cpuKeys: [String] = []
     private var tempKeys: [String] = []
     private var isEditingSpeed = false
@@ -372,12 +417,12 @@ final class FanController: ObservableObject {
         }
     }
 
-    private func loadFans() {
+    private func loadFans(reset: Bool = true) {
         guard let count = smc.readDouble("FNum"), count > 0 else {
-            errorMessage = "没有风扇（无风扇机型）"
+            if reset { errorMessage = "没有风扇（无风扇机型）" }
             return
         }
-        fans = (0..<Int(count)).compactMap { index in
+        let fresh = (0..<Int(count)).compactMap { index -> FanInfo? in
             guard let actual = smc.readDouble("F\(index)Ac"),
                   let minRPM = smc.readDouble("F\(index)Mn"),
                   let maxRPM = smc.readDouble("F\(index)Mx") else { return nil }
@@ -387,33 +432,66 @@ final class FanController: ObservableObject {
                 minRPM: minRPM,
                 maxRPM: maxRPM,
                 targetRPM: smc.readDouble("F\(index)Tg") ?? actual,
-                isManual: isManual(index: index)
+                isManual: readManualFlag(index: index) ?? false
             )
         }
+        guard !fresh.isEmpty else {
+            if reset { errorMessage = "没有风扇（无风扇机型）" }
+            return
+        }
+        errorMessage = nil
+        fans = fresh
     }
 
-    private func isManual(index: Int) -> Bool {
+    private func readManualFlag(index: Int) -> Bool? {
         if let flags = smc.readUInt8("FS! ") {
             return (flags & (1 << index)) != 0
         }
         if let mode = smc.readUInt8("F\(index)Md") ?? smc.readUInt8("F\(index)md") {
             return mode == 1
         }
-        return false
+        return nil
+    }
+
+    @discardableResult
+    private func refreshFanReadings() -> Bool {
+        var any = false
+        for i in fans.indices {
+            let idx = fans[i].id
+            if let actual = smc.readDouble("F\(idx)Ac"), actual >= 0, actual <= fans[i].maxRPM * 1.5 + 1000 {
+                fans[i].actualRPM = actual
+                any = true
+            }
+            if let target = smc.readDouble("F\(idx)Tg") {
+                fans[i].targetRPM = target
+                any = true
+            }
+            if let manual = readManualFlag(index: idx) {
+                fans[i].isManual = manual
+                any = true
+            }
+        }
+        return any
     }
 
     private func tick() {
-        for i in fans.indices {
-            let idx = fans[i].id
-            if let actual = smc.readDouble("F\(idx)Ac") { fans[i].actualRPM = actual }
-            if let target = smc.readDouble("F\(idx)Tg") { fans[i].targetRPM = target }
-            fans[i].isManual = isManual(index: idx)
+        if refreshFanReadings() {
+            readFailStreak = 0
+        } else {
+            readFailStreak += 1
+            if readFailStreak >= 3 {
+                // Fan values frozen/gone usually means the SMC connection went stale; rebuild it.
+                readFailStreak = 0
+                smc.close()
+                if smc.open() { loadFans(reset: false) }
+            }
         }
         refreshTemps()
         competitor = Self.detectCompetitor()
         refreshCurveTarget()
         if isEditingSpeed, Date().timeIntervalSince(speedEditBegan) < 30 { return }
         isEditingSpeed = false
+        guard writeInFlightGeneration == nil else { return }
         switch mode {
         case .fixed:
             if Date().timeIntervalSince(lastReapply) > 8, !fans.allSatisfy(\.isManual) {
@@ -488,20 +566,41 @@ final class FanController: ObservableObject {
         }
     }
 
+    nonisolated private static func setAutoWithRetry() -> PrivilegedWriter.Outcome {
+        var outcome = PrivilegedWriter.setAllAuto()
+        if !outcome.ok {
+            Thread.sleep(forTimeInterval: 0.4)
+            outcome = PrivilegedWriter.setAllAuto()
+        }
+        return outcome
+    }
+
+    nonisolated private static func setFixedWithRetry(rpm: Double, promptIfNeeded: Bool) -> PrivilegedWriter.Outcome {
+        var outcome = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: promptIfNeeded)
+        if !outcome.ok {
+            Thread.sleep(forTimeInterval: 0.4)
+            outcome = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: promptIfNeeded)
+        }
+        return outcome
+    }
+
     func selectAuto() {
         mode = .auto
         applying = true
         writeError = nil
         applyGeneration += 1
         let generation = applyGeneration
+        writeInFlightGeneration = generation
         Task.detached { [weak self] in
-            let ok = PrivilegedWriter.setAllAuto()
-            let passwordless = ok || PrivilegedWriter.hasPasswordlessSudo()
+            let outcome = Self.setAutoWithRetry()
+            let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
             await MainActor.run { [weak self] in
-                guard let self, self.applyGeneration == generation else { return }
+                guard let self else { return }
+                guard self.applyGeneration == generation else { return }
+                self.writeInFlightGeneration = nil
                 self.applying = false
-                self.recordResult(ok: ok, passwordless: passwordless, failText: "交还系统控制失败，请再试一次。")
-                if ok {
+                self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "交还系统控制失败，请再试一次。", detail: outcome.detail)
+                if outcome.ok {
                     for i in self.fans.indices { self.fans[i].isManual = false }
                 }
             }
@@ -524,6 +623,17 @@ final class FanController: ObservableObject {
         speedEditBegan = Date()
     }
 
+    func endSpeedEdit() {
+        isEditingSpeed = false
+    }
+
+    /// Clear one-off failure hints so a stale error doesn't haunt every panel open.
+    func clearTransientFeedback() {
+        applying = false
+        writeError = nil
+        needsAdmin = false
+    }
+
     func applyFixed(rpm: Double? = nil, silent: Bool = false) {
         isEditingSpeed = false
         if let rpm {
@@ -537,9 +647,15 @@ final class FanController: ObservableObject {
 
     func addCurvePoint() {
         guard curvePoints.count < 8 else { return }
-        let last = curvePoints.max(by: { $0.celsius < $1.celsius })
-        let nextTemp = min(99, (last?.celsius ?? 50) + 10)
-        let nextRPM = min(sliderMax, (last?.rpm ?? sliderMin) + 500)
+        let lastCelsius = curvePoints.map(\.celsius).max() ?? 40
+        let lastRPM = curvePoints.max(by: { $0.celsius < $1.celsius })?.rpm ?? sliderMin
+        let taken = Set(curvePoints.map { Int($0.celsius.rounded()) })
+        var nextTemp = min(lastCelsius + 10, 105)
+        while taken.contains(Int(nextTemp.rounded())) && nextTemp > 0 {
+            nextTemp -= 5
+        }
+        guard !taken.contains(Int(nextTemp.rounded())) else { return }
+        let nextRPM = min(max(lastRPM + 500, sliderMin), sliderMax)
         curvePoints.append(FanCurvePoint(celsius: nextTemp, rpm: nextRPM))
         persistCurve()
         scheduleCurveApply()
@@ -581,6 +697,8 @@ final class FanController: ObservableObject {
         let stale = Date().timeIntervalSince(lastReapply) > 8 && !fans.allSatisfy(\.isManual)
         let changed = lastAppliedRPM.map { abs($0 - target) >= 80 } ?? true
         guard force || stale || changed else { return }
+        if silent, !force, Date().timeIntervalSince(lastSilentCurveApply) < 3 { return }
+        if silent { lastSilentCurveApply = Date() }
         writeRPM(target, silent: silent)
     }
 
@@ -589,26 +707,36 @@ final class FanController: ObservableObject {
         lastReapply = Date()
         applyGeneration += 1
         let generation = applyGeneration
+        writeInFlightGeneration = generation
         if silent {
-            Task.detached {
-                _ = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: false)
+            Task.detached { [weak self] in
+                let outcome = Self.setFixedWithRetry(rpm: rpm, promptIfNeeded: false)
+                let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    if self.writeInFlightGeneration == generation { self.writeInFlightGeneration = nil }
+                    guard self.applyGeneration == generation else { return }
+                    self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "自动调整转速失败，请重新切换一次策略。", detail: outcome.detail)
+                }
             }
             return
         }
         applying = true
         writeError = nil
         Task.detached { [weak self] in
-            let ok = PrivilegedWriter.setAllFixed(rpm: rpm)
-            let passwordless = ok || PrivilegedWriter.hasPasswordlessSudo()
+            let outcome = Self.setFixedWithRetry(rpm: rpm, promptIfNeeded: true)
+            let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
             await MainActor.run { [weak self] in
-                guard let self, self.applyGeneration == generation else { return }
+                guard let self else { return }
+                guard self.applyGeneration == generation else { return }
+                self.writeInFlightGeneration = nil
                 self.applying = false
-                self.recordResult(ok: ok, passwordless: passwordless, failText: "写入转速失败，请再试一次。")
+                self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "写入转速失败，请再试一次。", detail: outcome.detail)
             }
         }
     }
 
-    private func recordResult(ok: Bool, passwordless: Bool, failText: String) {
+    private func recordResult(ok: Bool, passwordless: Bool, failText: String, detail: String = "") {
         self.passwordless = passwordless
         if ok {
             needsAdmin = false
@@ -617,7 +745,7 @@ final class FanController: ObservableObject {
         }
         if passwordless {
             needsAdmin = false
-            writeError = failText
+            writeError = detail.isEmpty ? failText : "\(failText)（\(detail)）"
         } else {
             needsAdmin = true
             writeError = nil

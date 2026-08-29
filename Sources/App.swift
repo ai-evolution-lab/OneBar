@@ -121,6 +121,7 @@ final class StatusBarController: NSObject {
         fanPopover.performClose(nil)
         clipWindow?.hide()
         guard !wasOpen, let button = item.button else { return }
+        if popover == fanPopover { state.fan.clearTransientFeedback() }
         button.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -198,7 +199,13 @@ private struct PanelChrome<Content: View>: View {
                 ))
                 .toggleStyle(.checkbox)
                 Spacer()
-                Button("退出") { state.quit() }
+                Button {
+                    state.quit()
+                } label: {
+                    Label("退出", systemImage: "power")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
             .font(.caption)
         }
@@ -216,15 +223,22 @@ private struct MemoryPanel: View {
             HStack(alignment: .firstTextBaseline) {
                 Text(String(format: "%.0f%%", mem.usedPercent))
                     .font(.system(size: 32, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
                 Spacer()
-                Text("压力 \(mem.pressure.title)")
+                Label(mem.pressure.title, systemImage: mem.pressure == .normal ? "checkmark.circle" : "exclamationmark.triangle")
+                    .font(.caption)
                     .foregroundStyle(mem.pressure == .normal ? Color.secondary : Color.orange)
             }
-            row("已用", bytes: mem.usedBytes, total: mem.totalBytes)
-            row("应用", bytes: mem.appBytes)
-            row("已联动", bytes: mem.wiredBytes)
-            row("压缩", bytes: mem.compressedBytes)
-            row("交换", bytes: mem.swapUsedBytes)
+            VStack(spacing: 5) {
+                row("已用", bytes: mem.usedBytes, total: mem.totalBytes)
+                row("应用", bytes: mem.appBytes)
+                row("已联动", bytes: mem.wiredBytes)
+                row("压缩", bytes: mem.compressedBytes)
+                row("交换", bytes: mem.swapUsedBytes)
+            }
+            .padding(.vertical, 9)
+            .padding(.horizontal, 11)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -239,6 +253,7 @@ private struct MemoryPanel: View {
             }
         }
         .font(.callout)
+        .monospacedDigit()
         .foregroundStyle(.secondary)
     }
 }
@@ -250,76 +265,134 @@ private struct FanPanel: View {
     var body: some View {
         PanelChrome(title: "风扇") {
             if let error = fan.errorMessage {
-                Text(error).foregroundStyle(.red).font(.callout)
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.red)
             } else {
-                HStack {
-                    Text(fan.cpuTemp.map { String(format: "CPU %.0f°C", $0) } ?? "CPU --")
+                VStack(alignment: .leading, spacing: 12) {
+                    tempHeader
+                    fanCard
+                    strategyPicker
+                    modeControls
+                    statusFootnotes
+                }
+            }
+        }
+    }
+
+    private var tempHeader: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(fan.cpuTemp.map { String(format: "%.0f", $0) } ?? "--")
+                .font(.system(size: 32, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text("°C")
+                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+            Text("CPU")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(fan.hottestTemp.map { String(format: "最高 %.0f°C", $0) } ?? "")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var fanCard: some View {
+        VStack(spacing: 6) {
+            ForEach(fan.fans) { item in
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(item.isManual ? Color.accentColor : Color.secondary.opacity(0.35))
+                        .frame(width: 7, height: 7)
+                    Text("风扇 \(item.id)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                     Spacer()
-                    Text(fan.hottestTemp.map { String(format: "最高 %.0f°C", $0) } ?? "")
+                    Text(String(format: "%.0f", item.actualRPM))
+                        .font(.system(.body, design: .monospaced).weight(.medium))
+                        .frame(width: 54, alignment: .trailing)
+                    Text(String(format: "%.0f–%.0f", item.minRPM, item.maxRPM))
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .frame(width: 92, alignment: .trailing)
                 }
-                .font(.callout)
+            }
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 11)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
 
-                ForEach(fan.fans) { item in
-                    HStack {
-                        Text("风扇 \(item.id)")
-                        Spacer()
-                        Text(String(format: "%.0f  (%.0f–%.0f)", item.actualRPM, item.minRPM, item.maxRPM))
-                            .font(.system(.callout, design: .monospaced))
+    private var strategyPicker: some View {
+        HStack(spacing: 10) {
+            Text("策略")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Picker("策略", selection: Binding(
+                get: { fan.mode },
+                set: { newValue in
+                    switch newValue {
+                    case .auto: fan.selectAuto()
+                    case .fixed: fan.selectFixed()
+                    case .curve: fan.selectCurve()
                     }
                 }
+            )) {
+                Text("自动").tag(FanMode.auto)
+                Text("固定").tag(FanMode.fixed)
+                Text("曲线").tag(FanMode.curve)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+    }
 
-                Picker("策略", selection: Binding(
-                    get: { fan.mode },
-                    set: { newValue in
-                        switch newValue {
-                        case .auto: fan.selectAuto()
-                        case .fixed: fan.selectFixed()
-                        case .curve: fan.selectCurve()
-                        }
-                    }
-                )) {
-                    Text("自动").tag(FanMode.auto)
-                    Text("固定").tag(FanMode.fixed)
-                    Text("曲线").tag(FanMode.curve)
-                }
-                .pickerStyle(.segmented)
+    @ViewBuilder
+    private var modeControls: some View {
+        if fan.mode == .fixed {
+            FixedSpeedControls(fan: fan)
+        }
+        if fan.mode == .curve {
+            CurveControls(fan: fan)
+        }
+    }
 
-                if fan.mode == .fixed {
-                    FixedSpeedControls(fan: fan)
-                }
-                if fan.mode == .curve {
-                    CurveControls(fan: fan)
-                }
-
-                if fan.applying {
-                    Text("正在写入…").font(.caption).foregroundStyle(.secondary)
-                }
-                if fan.passwordless {
-                    Text("已授权，切换策略不再要密码。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else {
+    @ViewBuilder
+    private var statusFootnotes: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if fan.applying {
+                Label("正在写入…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if fan.passwordless {
+                Label("已授权，切换策略不再要密码。", systemImage: "checkmark.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 6) {
                     Button("授权风扇控制（仅一次）") { fan.authorize() }
-                    Text("第一次输入密码后写入系统授权，之后切换都不再弹窗。")
+                        .controlSize(.small)
+                    Text("首次输入密码后写入系统授权。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                if let other = fan.competitor {
-                    Text("\(other) 正在运行，会抢风扇控制，请先退出它。")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                if fan.needsAdmin {
-                    Text("授权失败，请再点一次「授权风扇控制」。")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                if let writeError = fan.writeError {
-                    Text(writeError)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
+            }
+            if let other = fan.competitor {
+                Label("\(other) 正在运行，会抢风扇控制。", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if fan.needsAdmin {
+                Label("授权失败，请再点一次「授权风扇控制」。", systemImage: "xmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let writeError = fan.writeError {
+                Label(writeError, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -328,11 +401,17 @@ private struct FanPanel: View {
 private struct FixedSpeedControls: View {
     @ObservedObject var fan: FanController
     @State private var draft: Double = 0
+    @State private var rpmText = ""
     @State private var dragging = false
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                Text("目标")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 26, alignment: .leading)
                 RPMSlider(
                     value: draft,
                     minValue: fan.sliderMin,
@@ -343,27 +422,56 @@ private struct FixedSpeedControls: View {
                             fan.beginSpeedEdit()
                         }
                         draft = value
+                        if !fieldFocused { rpmText = String(format: "%.0f", value) }
                     },
                     onEnded: { value in
                         dragging = false
                         draft = value
+                        rpmText = String(format: "%.0f", value)
                         fan.applyFixed(rpm: value)
                     }
                 )
                 .frame(minHeight: 22)
-                TextField("", value: $draft, format: .number.precision(.fractionLength(0)))
-                    .frame(width: 64)
+                TextField("", text: $rpmText)
+                    .font(.system(.callout, design: .monospaced))
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 60)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { fan.applyFixed(rpm: draft) }
+                    .focused($fieldFocused)
+                    .onSubmit { commitText() }
+                    .onChange(of: fieldFocused) { _, focused in
+                        if focused {
+                            fan.beginSpeedEdit()
+                        } else {
+                            commitText()
+                        }
+                    }
             }
             Text("两颗风扇共用这个目标，超出各自上下限时自动钳位。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
-        .onAppear { draft = fan.fixedRPM }
-        .onChange(of: fan.fixedRPM) { _, newValue in
-            if !dragging { draft = newValue }
+        .onAppear {
+            draft = fan.fixedRPM
+            rpmText = String(format: "%.0f", fan.fixedRPM)
         }
+        .onChange(of: fan.fixedRPM) { _, newValue in
+            if !dragging {
+                draft = newValue
+                if !fieldFocused { rpmText = String(format: "%.0f", newValue) }
+            }
+        }
+    }
+
+    /// Commit only on submit/focus-loss: editing stays untouched until the value is valid on purpose.
+    private func commitText() {
+        let cleaned = rpmText.filter { "0123456789".contains($0) }
+        guard let value = Double(cleaned), value > 0 else {
+            draft = fan.fixedRPM
+            rpmText = String(format: "%.0f", fan.fixedRPM)
+            return
+        }
+        fan.applyFixed(rpm: value)
     }
 }
 
@@ -371,53 +479,141 @@ private struct CurveControls: View {
     @ObservedObject var fan: FanController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(fan.curvePoints.sorted(by: { $0.celsius < $1.celsius })) { point in
-                HStack(spacing: 4) {
-                    Text("≥")
-                        .foregroundStyle(.secondary)
-                    TextField("", value: Binding(
-                        get: { point.celsius },
-                        set: { fan.updateCurvePoint(id: point.id, celsius: $0) }
-                    ), format: .number.precision(.fractionLength(0)))
-                    .frame(width: 40)
-                    .textFieldStyle(.roundedBorder)
-                    Text("°C")
-                        .foregroundStyle(.secondary)
-                    Text("→")
-                        .foregroundStyle(.secondary)
-                    TextField("", value: Binding(
-                        get: { point.rpm },
-                        set: { fan.updateCurvePoint(id: point.id, rpm: $0) }
-                    ), format: .number.precision(.fractionLength(0)))
-                    .frame(width: 56)
-                    .textFieldStyle(.roundedBorder)
-                    Text("RPM")
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                    Button {
-                        fan.removeCurvePoint(point.id)
-                    } label: {
-                        Image(systemName: "minus.circle")
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(fan.curvePoints.count <= 1)
-                    .foregroundStyle(fan.curvePoints.count <= 1 ? Color.secondary : Color.primary)
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(spacing: 6) {
+                ForEach(fan.curvePoints.sorted(by: { $0.celsius < $1.celsius })) { point in
+                    CurveRow(fan: fan, point: point)
                 }
-                .font(.callout)
             }
+            .padding(.vertical, 4)
             HStack {
-                Button("添加条件") { fan.addCurvePoint() }
-                    .disabled(fan.curvePoints.count >= 8)
+                Button {
+                    fan.addCurvePoint()
+                } label: {
+                    Label("添加条件", systemImage: "plus.circle.fill")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(Color.accentColor)
+                .disabled(fan.curvePoints.count >= 8)
+                .opacity(fan.curvePoints.count >= 8 ? 0.4 : 1)
                 Spacer()
-                Text(String(format: "当前 %.0f RPM", fan.curveTargetRPM))
-                    .foregroundStyle(.secondary)
+                Text(String(format: "%.0f RPM", fan.curveTargetRPM))
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .foregroundStyle(Color.accentColor)
             }
-            .font(.caption)
-            Text("按 CPU 温度匹配最高满足的条件；低于全部阈值时用最低转速。")
+            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// Edits stay in local drafts and commit on submit/focus-loss; writing the model on every
+/// keystroke made clamped values (and the sorted row order) jump around mid-typing.
+private struct CurveRow: View {
+    @ObservedObject var fan: FanController
+    let point: FanCurvePoint
+
+    @State private var celsiusDraft = ""
+    @State private var rpmDraft = ""
+    @FocusState private var focusedField: Field?
+
+    enum Field: Hashable {
+        case celsius
+        case rpm
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("≥")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(width: 12)
+            TextField("", text: $celsiusDraft)
+                .font(.system(.callout, design: .monospaced))
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 42)
+                .focused($focusedField, equals: .celsius)
+                .onSubmit { commitCelsius() }
+            Text("°C")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 22, alignment: .leading)
+            Text("→")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+                .frame(width: 12)
+            TextField("", text: $rpmDraft)
+                .font(.system(.callout, design: .monospaced))
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 58)
+                .focused($focusedField, equals: .rpm)
+                .onSubmit { commitRPM() }
+            Text("RPM")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .leading)
+            Spacer(minLength: 4)
+            Button {
+                fan.removeCurvePoint(point.id)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(fan.curvePoints.count <= 1)
+            .foregroundStyle(
+                fan.curvePoints.count <= 1
+                    ? Color.secondary.opacity(0.3)
+                    : Color.secondary.opacity(0.7)
+            )
+        }
+        .onAppear { syncDrafts() }
+        .onChange(of: point) { _, _ in
+            if focusedField == nil { syncDrafts() }
+        }
+        .onChange(of: focusedField) { _, field in
+            if field != nil {
+                fan.beginSpeedEdit()
+            } else {
+                commitAll()
+            }
+        }
+    }
+
+    private func syncDrafts() {
+        celsiusDraft = String(format: "%.0f", point.celsius)
+        rpmDraft = String(format: "%.0f", point.rpm)
+    }
+
+    private func commitCelsius() {
+        let cleaned = celsiusDraft.filter { "0123456789".contains($0) }
+        guard let value = Double(cleaned) else {
+            celsiusDraft = String(format: "%.0f", point.celsius)
+            return
+        }
+        fan.updateCurvePoint(id: point.id, celsius: value)
+    }
+
+    private func commitRPM() {
+        let cleaned = rpmDraft.filter { "0123456789".contains($0) }
+        guard let value = Double(cleaned) else {
+            rpmDraft = String(format: "%.0f", point.rpm)
+            return
+        }
+        fan.updateCurvePoint(id: point.id, rpm: value)
+    }
+
+    private func commitAll() {
+        commitCelsius()
+        commitRPM()
+        fan.endSpeedEdit()
     }
 }
 
