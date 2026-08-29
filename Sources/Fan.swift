@@ -32,20 +32,66 @@ struct FanCurvePoint: Identifiable, Codable, Equatable {
 }
 
 enum FanCurve {
+    /// Fine-grained in 50–70°: that's the common operating band, so steps are small
+    /// (300–500 RPM). Above 70° bigger jumps are fine — that's emergency territory.
     static let defaults: [FanCurvePoint] = [
+        FanCurvePoint(celsius: 50, rpm: 1700),
+        FanCurvePoint(celsius: 55, rpm: 2000),
+        FanCurvePoint(celsius: 60, rpm: 2400),
+        FanCurvePoint(celsius: 65, rpm: 2900),
+        FanCurvePoint(celsius: 70, rpm: 3500),
+        FanCurvePoint(celsius: 85, rpm: 5200),
+    ]
+
+    /// Defaults before the finer 50–70° curve. A stored curve matching this is
+    /// treated as never customized and migrated to `defaults`.
+    static let legacyDefaults: [FanCurvePoint] = [
         FanCurvePoint(celsius: 55, rpm: 2000),
         FanCurvePoint(celsius: 70, rpm: 3500),
         FanCurvePoint(celsius: 85, rpm: 5200),
     ]
 
+    /// Step-down hysteresis in °C. After entering a level at threshold T, the fan
+    /// only drops back once temp falls below T - hysteresis; stepping up stays
+    /// immediate. Without this, temp hovering around a threshold makes the speed
+    /// flip between two levels on every 2s sample.
+    static let dropHysteresis: Double = 2.5
+
+    static func sortedPoints(_ points: [FanCurvePoint]) -> [FanCurvePoint] {
+        points.sorted { $0.celsius < $1.celsius }
+    }
+
+    /// Highest matching threshold index; -1 means below all points (floor).
+    static func level(for temp: Double, sorted: [FanCurvePoint]) -> Int {
+        var level = -1
+        for (index, point) in sorted.enumerated() where temp >= point.celsius {
+            level = index
+        }
+        return level
+    }
+
+    /// Hysteresis-aware level: up is instant, down from `currentLevel` waits until
+    /// temp is `hysteresis` below that level's entry threshold. Stale levels
+    /// (curve shrank after an edit) bypass the hold.
+    static func stableLevel(
+        for temp: Double,
+        sorted: [FanCurvePoint],
+        currentLevel: Int,
+        hysteresis: Double
+    ) -> Int {
+        let raw = level(for: temp, sorted: sorted)
+        guard raw < currentLevel, currentLevel >= 0, currentLevel < sorted.count else { return raw }
+        return temp >= sorted[currentLevel].celsius - hysteresis ? currentLevel : raw
+    }
+
+    static func rpm(level: Int, sorted: [FanCurvePoint], floor: Double) -> Double {
+        level < 0 ? floor : sorted[level].rpm
+    }
+
     /// Highest matching threshold; below all points uses `floor`.
     static func rpm(for temp: Double, points: [FanCurvePoint], floor: Double) -> Double {
-        let sorted = points.sorted { $0.celsius < $1.celsius }
-        var result = floor
-        for point in sorted where temp >= point.celsius {
-            result = point.rpm
-        }
-        return result
+        let sorted = sortedPoints(points)
+        return rpm(level: level(for: temp, sorted: sorted), sorted: sorted, floor: floor)
     }
 
     static func runSelfTest() -> Int32 {
@@ -67,6 +113,31 @@ enum FanCurve {
         if rpm(for: 60, points: [], floor: 1200) != 1200 {
             fputs("curve selftest failed: empty points\n", stderr)
             return 1
+        }
+
+        // Hysteresis: step up instantly, hold on the way down until temp clears
+        // the entry threshold minus hysteresis.
+        let sorted = sortedPoints([
+            FanCurvePoint(celsius: 50, rpm: 2000),
+            FanCurvePoint(celsius: 55, rpm: 2400),
+            FanCurvePoint(celsius: 60, rpm: 2900),
+            FanCurvePoint(celsius: 65, rpm: 3500),
+            FanCurvePoint(celsius: 70, rpm: 4200),
+        ])
+        let hysteresisCases: [(Double, Int, Int)] = [
+            (49.9, -1, -1), // below all: floor, nothing to hold
+            (61.0, 1, 2),   // crossed 60: up immediately
+            (58.5, 2, 2),   // 58.5 >= 60 - 2.5: hold level 2
+            (57.4, 2, 1),   // 57.4 < 57.5: released to raw level
+            (66.0, 2, 3),   // up across 65
+            (45.0, 9, -1),  // stale level past the last point: raw
+        ]
+        for (temp, current, expected) in hysteresisCases {
+            let got = stableLevel(for: temp, sorted: sorted, currentLevel: current, hysteresis: 2.5)
+            if got != expected {
+                fputs("curve selftest failed: hysteresis \(temp)@L\(current) -> L\(got) expected L\(expected)\n", stderr)
+                return 1
+            }
         }
         return 0
     }
@@ -340,6 +411,7 @@ final class FanController: ObservableObject {
     private var timer: Timer?
     private var lastReapply = Date.distantPast
     private var lastAppliedRPM: Double?
+    private var curveLevel = -1
     private var applyGeneration = 0
     private var writeInFlightGeneration: Int?
     private var readFailStreak = 0
@@ -402,6 +474,14 @@ final class FanController: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: curveKey),
               let points = try? JSONDecoder().decode([FanCurvePoint].self, from: data),
               !points.isEmpty else {
+            return FanCurve.defaults
+        }
+        // A stored curve identical to the pre-50–70° defaults was never customized;
+        // move it to the finer defaults instead of pinning the old coarse one.
+        if points.count == FanCurve.legacyDefaults.count,
+           zip(points, FanCurve.legacyDefaults).allSatisfy({
+               abs($0.celsius - $1.celsius) < 0.5 && abs($0.rpm - $1.rpm) < 1
+           }) {
             return FanCurve.defaults
         }
         return points
@@ -536,9 +616,23 @@ final class FanController: ObservableObject {
     func refreshCurveTarget() {
         let temp = cpuTemp ?? hottestTemp ?? 0
         let floor = sliderMin
-        var target = FanCurve.rpm(for: temp, points: curvePoints, floor: floor)
+        let sorted = FanCurve.sortedPoints(curvePoints)
+        let level = FanCurve.stableLevel(
+            for: temp,
+            sorted: sorted,
+            currentLevel: curveLevel,
+            hysteresis: FanCurve.dropHysteresis
+        )
+        curveLevel = level
+        var target = FanCurve.rpm(level: level, sorted: sorted, floor: floor)
         if temp >= 100 { target = sliderMax }
         curveTargetRPM = min(max(target, sliderMin), sliderMax)
+    }
+
+    /// Curve edits invalidate the held level; re-derive it from raw temp on the new curve.
+    private func resetCurveLevel() {
+        let temp = cpuTemp ?? hottestTemp ?? 0
+        curveLevel = FanCurve.level(for: temp, sorted: FanCurve.sortedPoints(curvePoints))
     }
 
     static func detectCompetitor() -> String? {
@@ -658,6 +752,7 @@ final class FanController: ObservableObject {
         let nextRPM = min(max(lastRPM + 500, sliderMin), sliderMax)
         curvePoints.append(FanCurvePoint(celsius: nextTemp, rpm: nextRPM))
         persistCurve()
+        resetCurveLevel()
         scheduleCurveApply()
     }
 
@@ -665,6 +760,7 @@ final class FanController: ObservableObject {
         guard curvePoints.count > 1 else { return }
         curvePoints.removeAll { $0.id == id }
         persistCurve()
+        resetCurveLevel()
         scheduleCurveApply()
     }
 
@@ -677,6 +773,7 @@ final class FanController: ObservableObject {
             curvePoints[index].rpm = min(max(rpm, sliderMin), sliderMax)
         }
         persistCurve()
+        resetCurveLevel()
         scheduleCurveApply()
     }
 

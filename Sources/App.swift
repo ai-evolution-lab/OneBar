@@ -506,7 +506,7 @@ private struct CurveControls: View {
                     .background(Color.accentColor.opacity(0.12), in: Capsule())
                     .foregroundStyle(Color.accentColor)
             }
-            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速。")
+            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速；降档需温度低于当前档位阈值 2.5°C，避免转速反复跳变。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
