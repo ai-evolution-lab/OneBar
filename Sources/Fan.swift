@@ -52,10 +52,20 @@ enum FanCurve {
     ]
 
     /// Step-down hysteresis in °C. After entering a level at threshold T, the fan
-    /// only drops back once temp falls below T - hysteresis; stepping up stays
-    /// immediate. Without this, temp hovering around a threshold makes the speed
-    /// flip between two levels on every 2s sample.
+    /// only drops back once temp falls below T - hysteresis. Without this, temp
+    /// hovering around a threshold makes the speed flip between two levels on
+    /// every 2s sample.
     static let dropHysteresis: Double = 2.5
+
+    /// Step-up sustain window in seconds. To step up to a level the temp must
+    /// stay continuously at/above that level's threshold for this long. Kills the
+    /// "58↔61° flip-flop": a momentary blip no longer yanks the fans up, so a
+    /// high-speed level can't turn on and off every few samples.
+    static let ascendSustain: TimeInterval = 60
+
+    /// Thresholds at/above this value ignore `ascendSustain` and step up
+    /// instantly — emergency territory, waiting there is never right.
+    static let ascendBypassCelsius: Double = 70
 
     static func sortedPoints(_ points: [FanCurvePoint]) -> [FanCurvePoint] {
         points.sorted { $0.celsius < $1.celsius }
@@ -70,9 +80,10 @@ enum FanCurve {
         return level
     }
 
-    /// Hysteresis-aware level: up is instant, down from `currentLevel` waits until
-    /// temp is `hysteresis` below that level's entry threshold. Stale levels
-    /// (curve shrank after an edit) bypass the hold.
+    /// Hysteresis-aware level: down from `currentLevel` waits until temp is
+    /// `hysteresis` below that level's entry threshold. Stale levels (curve
+    /// shrank after an edit) bypass the hold. Stepping up is NOT handled here —
+    /// see `ascentTick`, which gates ascents behind a sustain window.
     static func stableLevel(
         for temp: Double,
         sorted: [FanCurvePoint],
@@ -82,6 +93,33 @@ enum FanCurve {
         let raw = level(for: temp, sorted: sorted)
         guard raw < currentLevel, currentLevel >= 0, currentLevel < sorted.count else { return raw }
         return temp >= sorted[currentLevel].celsius - hysteresis ? currentLevel : raw
+    }
+
+    /// One tick of the step-up sustain state machine. When raw level wants to go
+    /// higher than `currentLevel`, hold the current level until temp has been
+    /// continuously at/above the target threshold for `sustain` seconds; entry
+    /// thresholds at/above `bypassCelsius` skip straight up. Returns the level to
+    /// use plus the pending wait, if any, to carry into the next tick.
+    static func ascentTick(
+        rawLevel: Int,
+        currentLevel: Int,
+        sorted: [FanCurvePoint],
+        entry: Double?,
+        since: Date?,
+        now: Date,
+        sustain: TimeInterval,
+        bypassCelsius: Double
+    ) -> (level: Int, entry: Double?, since: Date?) {
+        guard rawLevel > currentLevel else { return (currentLevel, nil, nil) }
+        let targetEntry = sorted[rawLevel].celsius
+        if targetEntry >= bypassCelsius { return (rawLevel, nil, nil) }
+        if entry == targetEntry, let since {
+            if now.timeIntervalSince(since) >= sustain {
+                return (rawLevel, nil, nil)
+            }
+            return (currentLevel, targetEntry, since)
+        }
+        return (currentLevel, targetEntry, now)
     }
 
     static func rpm(level: Int, sorted: [FanCurvePoint], floor: Double) -> Double {
@@ -138,6 +176,48 @@ enum FanCurve {
                 fputs("curve selftest failed: hysteresis \(temp)@L\(current) -> L\(got) expected L\(expected)\n", stderr)
                 return 1
             }
+        }
+
+        // Ascend sustain: temp must hold over the target threshold before the
+        // fan steps up; a stray 61° blip among 58–59° must not trigger it.
+        let t0 = Date()
+        let tick = { (raw: Int, cur: Int, entry: Double?, since: Date?, now: Date) -> (Int, Double?, Date?) in
+            let s = ascentTick(
+                rawLevel: raw, currentLevel: cur, sorted: sorted,
+                entry: entry, since: since, now: now,
+                sustain: 60, bypassCelsius: 70
+            )
+            return (s.level, s.entry, s.since)
+        }
+        var s = tick(2, -1, nil, nil, t0) // 61° start: target 60°, begin wait
+        if s.0 != -1 || s.1 != 60 || s.2 != t0 {
+            fputs("curve selftest failed: sustain start L\(s.0) \(String(describing: s.1))\n", stderr)
+            return 1
+        }
+        s = tick(2, -1, s.1, s.2, t0 + 10) // 10s in: still holding
+        if s.0 != -1 || s.1 != 60 || s.2 != t0 {
+            fputs("curve selftest failed: sustain hold L\(s.0)\n", stderr)
+            return 1
+        }
+        s = tick(2, -1, s.1, s.2, t0 + 60) // 60s in: release to 60° level
+        if s.0 != 2 || s.1 != nil || s.2 != nil {
+            fputs("curve selftest failed: sustain release L\(s.0)\n", stderr)
+            return 1
+        }
+        s = tick(4, 0, nil, nil, t0) // 70° (bypass) target: immediate
+        if s.0 != 4 || s.1 != nil {
+            fputs("curve selftest failed: bypass L\(s.0)\n", stderr)
+            return 1
+        }
+        s = tick(2, -1, 65, t0, t0 + 5) // target drifted 65→60 mid-hold: restart
+        if s.0 != -1 || s.1 != 60 || s.2 != t0 + 5 {
+            fputs("curve selftest failed: sustain restart L\(s.0)\n", stderr)
+            return 1
+        }
+        s = tick(1, 2, 60, t0, t0) // descending: gate idle
+        if s.0 != 2 || s.1 != nil {
+            fputs("curve selftest failed: sustain idle L\(s.0)\n", stderr)
+            return 1
         }
         return 0
     }
@@ -412,6 +492,8 @@ final class FanController: ObservableObject {
     private var lastReapply = Date.distantPast
     private var lastAppliedRPM: Double?
     private var curveLevel = -1
+    private var ascendEntry: Double?
+    private var ascendSince: Date?
     private var applyGeneration = 0
     private var writeInFlightGeneration: Int?
     private var readFailStreak = 0
@@ -617,22 +699,43 @@ final class FanController: ObservableObject {
         let temp = cpuTemp ?? hottestTemp ?? 0
         let floor = sliderMin
         let sorted = FanCurve.sortedPoints(curvePoints)
-        let level = FanCurve.stableLevel(
-            for: temp,
-            sorted: sorted,
-            currentLevel: curveLevel,
-            hysteresis: FanCurve.dropHysteresis
-        )
-        curveLevel = level
-        var target = FanCurve.rpm(level: level, sorted: sorted, floor: floor)
+        let raw = FanCurve.level(for: temp, sorted: sorted)
+        if raw > curveLevel {
+            let step = FanCurve.ascentTick(
+                rawLevel: raw,
+                currentLevel: curveLevel,
+                sorted: sorted,
+                entry: ascendEntry,
+                since: ascendSince,
+                now: Date(),
+                sustain: FanCurve.ascendSustain,
+                bypassCelsius: FanCurve.ascendBypassCelsius
+            )
+            curveLevel = step.level
+            ascendEntry = step.entry
+            ascendSince = step.since
+        } else {
+            ascendEntry = nil
+            ascendSince = nil
+            curveLevel = FanCurve.stableLevel(
+                for: temp,
+                sorted: sorted,
+                currentLevel: curveLevel,
+                hysteresis: FanCurve.dropHysteresis
+            )
+        }
+        var target = FanCurve.rpm(level: curveLevel, sorted: sorted, floor: floor)
         if temp >= 100 { target = sliderMax }
         curveTargetRPM = min(max(target, sliderMin), sliderMax)
     }
 
-    /// Curve edits invalidate the held level; re-derive it from raw temp on the new curve.
+    /// Curve edits invalidate the held level and any pending ascend wait;
+    /// re-derive from raw temp on the new curve.
     private func resetCurveLevel() {
         let temp = cpuTemp ?? hottestTemp ?? 0
         curveLevel = FanCurve.level(for: temp, sorted: FanCurve.sortedPoints(curvePoints))
+        ascendEntry = nil
+        ascendSince = nil
     }
 
     static func detectCompetitor() -> String? {
