@@ -72,6 +72,8 @@ final class StatusBarController: NSObject {
             button.imagePosition = .imageOnly
             button.target = self
             button.action = #selector(toggleClipboard(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.toolTip = "点按打开剪贴板，右键可重新启动或退出"
         }
         embed(MemoryPanel().environmentObject(state), in: memoryPopover)
         embed(
@@ -98,6 +100,8 @@ final class StatusBarController: NSObject {
         item.button?.title = title
         item.button?.target = self
         item.button?.action = action
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        item.button?.toolTip = "点按打开面板，右键可重新启动或退出"
     }
 
     private func embed<V: View>(_ view: V, in popover: NSPopover) {
@@ -127,13 +131,39 @@ final class StatusBarController: NSObject {
         fanItem.button?.title = state.fan.menuTitle
     }
 
-    @objc private func toggleMemory(_ sender: Any?) { toggle(memoryPopover, from: memoryItem) }
-    @objc private func toggleFan(_ sender: Any?) { toggle(fanPopover, from: fanItem) }
+    @objc private func toggleMemory(_ sender: Any?) {
+        if popAppMenuIfRightClick(from: memoryItem) { return }
+        toggle(memoryPopover, from: memoryItem)
+    }
+    @objc private func toggleFan(_ sender: Any?) {
+        if popAppMenuIfRightClick(from: fanItem) { return }
+        toggle(fanPopover, from: fanItem)
+    }
     @objc private func toggleClipboard(_ sender: Any?) {
+        if popAppMenuIfRightClick(from: clipItem) { return }
         memoryPopover.performClose(nil)
         fanPopover.performClose(nil)
         clipWindow?.toggle()
     }
+
+    private func popAppMenuIfRightClick(from item: NSStatusItem) -> Bool {
+        guard let event = NSApp.currentEvent else { return false }
+        guard event.type == .rightMouseUp || event.modifierFlags.contains(.control) else { return false }
+        guard let button = item.button else { return false }
+        let menu = NSMenu()
+        let relaunch = NSMenuItem(title: "重新启动", action: #selector(menuRelaunch), keyEquivalent: "")
+        relaunch.target = self
+        menu.addItem(relaunch)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 OneBar", action: #selector(menuQuit), keyEquivalent: "")
+        quit.target = self
+        menu.addItem(quit)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
+        return true
+    }
+
+    @objc private func menuRelaunch() { state.relaunch() }
+    @objc private func menuQuit() { state.quit() }
 
     private func toggle(_ popover: NSPopover, from item: NSStatusItem) {
         let wasOpen = popover.isShown
@@ -217,6 +247,31 @@ final class AppState: ObservableObject {
         fan.restoreAutoOnQuit()
         NSApp.terminate(nil)
     }
+
+    func relaunch() {
+        fan.restoreAutoOnQuit()
+        let bundle = Bundle.main.bundlePath
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let quoted = "'" + bundle.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = [
+            "-c",
+            "while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.15; done; exec /usr/bin/open \(quoted)",
+        ]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            AppState.relaunchJob = proc
+        } catch {
+            NSApp.terminate(nil)
+            return
+        }
+        NSApp.terminate(nil)
+    }
+
+    private static var relaunchJob: Process?
 }
 
 private struct PanelChrome<Content: View>: View {
@@ -243,6 +298,13 @@ private struct PanelChrome<Content: View>: View {
                 ))
                 .toggleStyle(.checkbox)
                 Spacer()
+                Button {
+                    state.relaunch()
+                } label: {
+                    Label("重新启动", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
                 Button {
                     state.quit()
                 } label: {

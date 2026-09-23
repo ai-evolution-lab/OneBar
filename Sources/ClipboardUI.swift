@@ -136,6 +136,16 @@ struct ClipboardRootView: View {
                     .font(.caption)
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+                Menu {
+                    Button("重新启动") { state.relaunch() }
+                    Button("退出 OneBar", role: .destructive) { state.quit() }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 16, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("重新启动或退出")
             }
             HStack(spacing: 6) {
                 ForEach(ClipboardFilter.allCases) { item in

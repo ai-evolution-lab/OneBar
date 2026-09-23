@@ -87,4 +87,6 @@ fi
 
 open "${INSTALL_DIR}"
 echo "已安装到 ${INSTALL_DIR}，OneBar 正在启动。"
+echo "之后可在「应用程序」里双击 OneBar 打开。"
+echo "任意菜单栏图标右键：重新启动 / 退出。"
 echo "若菜单栏没有图标：系统设置 → 菜单栏，打开 OneBar。"
