@@ -28,9 +28,22 @@ struct ClipboardItem: Identifiable, Equatable {
     var byteCount: Int64
     var isFavorite: Bool
     var thumbPath: String?
+    var charCount: Int
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM月dd日"
+        return formatter
+    }()
+
+    /// 渲染路径专用的有界预览：长文本只取前缀，避免 Text 排版 / count 全文遍历拖垮滚动。
+    var displayText: String {
+        guard let text else { return preview }
+        return String(text.prefix(300))
+    }
 
     var previewSourcePath: String? {
-        if let thumbPath, FileManager.default.fileExists(atPath: thumbPath) { return thumbPath }
+        if let thumbPath { return thumbPath }
         if kind == .image { return imagePath }
         if kind == .file, let path = filePaths.first, ClipboardItem.isImageFile(path) {
             return path
@@ -41,8 +54,7 @@ struct ClipboardItem: Identifiable, Equatable {
     var sizeLabel: String {
         switch kind {
         case .text:
-            let n = text?.count ?? preview.count
-            return "\(n) 个字符"
+            return "\(charCount) 个字符"
         case .image, .file:
             return ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file)
         }
@@ -54,9 +66,7 @@ struct ClipboardItem: Identifiable, Equatable {
         if minutes < 60 { return "\(minutes) 分钟前" }
         let hours = minutes / 60
         if hours < 24 { return "\(hours) 小时前" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MM月dd日"
-        return formatter.string(from: createdAt)
+        return Self.dateFormatter.string(from: createdAt)
     }
 
     static func isImageFile(_ path: String) -> Bool {
@@ -247,22 +257,42 @@ final class ClipboardStore: ObservableObject {
             return
         }
         ignoreUntilCount = nil
-        capture()
+        scheduleCapture()
     }
 
-    private func capture() {
+    /// 粘贴板转换 / 图片落盘 / 缩略图生成都是主线程杀手（复制大图能卡上百毫秒），
+    /// 统一挪到串行队列，按顺序回到主线程插入，保证时间序不乱。
+    private func scheduleCapture() {
+        let pb = pasteboard
+        let ignored = ignoredTypes
+        let images = imagesDir
+        captureQueue.async { [weak self] in
+            guard let item = Self.readItem(from: pb, ignored: ignored, imagesDir: images) else { return }
+            Task { @MainActor [weak self] in self?.commit(item) }
+        }
+    }
+
+    private func commit(_ item: ClipboardItem) {
+        switch item.kind {
+        case .file: if items.first?.filePaths == item.filePaths { return }
+        case .text: if items.first?.text == item.text { return }
+        case .image: break
+        }
+        prepend(item)
+    }
+
+    private nonisolated static func readItem(from pasteboard: NSPasteboard, ignored: Set<String>, imagesDir: URL) -> ClipboardItem? {
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
-        if !ignoredTypes.isDisjoint(with: types) { return }
+        if !ignored.isDisjoint(with: types) { return nil }
 
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
            !urls.isEmpty, urls.allSatisfy(\.isFileURL) {
             let paths = urls.map(\.path)
-            if items.first?.filePaths == paths { return }
             let bytes = paths.reduce(Int64(0)) { sum, path in
                 let n = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
                 return sum + n
             }
-            prepend(ClipboardItem(
+            return ClipboardItem(
                 id: UUID(),
                 kind: .file,
                 createdAt: Date(),
@@ -272,17 +302,17 @@ final class ClipboardStore: ObservableObject {
                 filePaths: paths,
                 byteCount: bytes,
                 isFavorite: false,
-                thumbPath: Self.makeThumb(from: paths.first)
-            ))
-            return
+                thumbPath: makeThumb(from: paths.first),
+                charCount: 0
+            )
         }
 
-        if let data = pasteboard.data(forType: .png) ?? tiffAsPNG() {
-            if data.count > 20 * 1024 * 1024 { return }
+        if let data = pasteboard.data(forType: .png) ?? tiffAsPNG(from: pasteboard) {
+            if data.count > 20 * 1024 * 1024 { return nil }
             let id = UUID()
             let file = imagesDir.appendingPathComponent("\(id.uuidString).png")
-            do { try data.write(to: file, options: .atomic) } catch { return }
-            prepend(ClipboardItem(
+            do { try data.write(to: file, options: .atomic) } catch { return nil }
+            return ClipboardItem(
                 id: id,
                 kind: .image,
                 createdAt: Date(),
@@ -292,16 +322,15 @@ final class ClipboardStore: ObservableObject {
                 filePaths: [],
                 byteCount: Int64(data.count),
                 isFavorite: false,
-                thumbPath: Self.makeThumb(from: file.path)
-            ))
-            return
+                thumbPath: makeThumb(from: file.path),
+                charCount: 0
+            )
         }
 
         if let text = pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !text.isEmpty {
-            if items.first?.text == text { return }
             let preview = text.count > 80 ? String(text.prefix(80)) + "…" : text
-            prepend(ClipboardItem(
+            return ClipboardItem(
                 id: UUID(),
                 kind: .text,
                 createdAt: Date(),
@@ -311,12 +340,14 @@ final class ClipboardStore: ObservableObject {
                 filePaths: [],
                 byteCount: Int64(text.utf8.count),
                 isFavorite: false,
-                thumbPath: nil
-            ))
+                thumbPath: nil,
+                charCount: text.count
+            )
         }
+        return nil
     }
 
-    private func tiffAsPNG() -> Data? {
+    private nonisolated static func tiffAsPNG(from pasteboard: NSPasteboard) -> Data? {
         guard let tiff = pasteboard.data(forType: .tiff),
               let image = NSImage(data: tiff),
               let tiffRep = image.tiffRepresentation,
@@ -329,7 +360,7 @@ final class ClipboardStore: ObservableObject {
         persist()
     }
 
-    private static func makeThumb(from source: String?) -> String? {
+    private nonisolated static func makeThumb(from source: String?) -> String? {
         guard let source, FileManager.default.fileExists(atPath: source) else { return nil }
         if !ClipboardItem.isImageFile(source), (source as NSString).pathExtension.lowercased() != "png" {
             return nil
@@ -351,16 +382,24 @@ final class ClipboardStore: ObservableObject {
         var byteCount: Int64?
         var isFavorite: Bool?
         var thumbPath: String?
+        var charCount: Int?
     }
+
+    private let persistQueue = DispatchQueue(label: "onebar.clip.persist", qos: .utility)
+    private let captureQueue = DispatchQueue(label: "onebar.clip.capture", qos: .userInitiated)
 
     private func persist() {
         let payload = items.map {
             DiskItem(id: $0.id, kind: $0.kind, createdAt: $0.createdAt, preview: $0.preview,
                      text: $0.text, imagePath: $0.imagePath, filePaths: $0.filePaths,
-                     byteCount: $0.byteCount, isFavorite: $0.isFavorite, thumbPath: $0.thumbPath)
+                     byteCount: $0.byteCount, isFavorite: $0.isFavorite, thumbPath: $0.thumbPath,
+                     charCount: $0.charCount)
         }
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        let url = indexURL
+        persistQueue.async {
+            guard let data = try? JSONEncoder().encode(payload) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     private func load() {
@@ -377,9 +416,15 @@ final class ClipboardStore: ObservableObject {
                     }
                 }
             }
+            var thumb = $0.thumbPath
+            if let t = thumb, !FileManager.default.fileExists(atPath: t) {
+                thumb = nil
+            }
+            let chars = $0.charCount ?? $0.text?.count ?? $0.preview.count
             return ClipboardItem(id: $0.id, kind: $0.kind, createdAt: $0.createdAt, preview: $0.preview,
-                          text: $0.text, imagePath: $0.imagePath, filePaths: $0.filePaths,
-                          byteCount: bytes, isFavorite: $0.isFavorite ?? false, thumbPath: $0.thumbPath)
+                           text: $0.text, imagePath: $0.imagePath, filePaths: $0.filePaths,
+                           byteCount: bytes, isFavorite: $0.isFavorite ?? false, thumbPath: thumb,
+                           charCount: chars)
         }
     }
 }

@@ -205,7 +205,8 @@ struct ClipboardRootView: View {
     }
 
     private var filtered: [ClipboardItem] {
-        clipboard.items.filter { item in
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clipboard.items.filter { item in
             switch filter {
             case .all: break
             case .text: if item.kind != .text { return false }
@@ -213,10 +214,9 @@ struct ClipboardRootView: View {
             case .file: if item.kind != .file { return false }
             case .favorite: if !item.isFavorite { return false }
             }
-            let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
             if q.isEmpty { return true }
-            return item.preview.localizedCaseInsensitiveContains(q)
-                || (item.text?.localizedCaseInsensitiveContains(q) ?? false)
+            if item.preview.localizedCaseInsensitiveContains(q) { return true }
+            return item.text?.prefix(5000).localizedCaseInsensitiveContains(q) ?? false
         }
     }
 }
@@ -231,6 +231,7 @@ private struct ClipboardRow: View {
     @State private var hovered = false
 
     var body: some View {
+        let actionsVisible = selected || hovered
         HStack(alignment: .top, spacing: 10) {
             Text("\(index)")
                 .font(.system(size: 18, weight: .bold, design: .rounded))
@@ -260,7 +261,8 @@ private struct ClipboardRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if selected || hovered {
+                    // 常驻布局、仅切透明度：滚动时鼠标扫过不再触发行内增删导致的重排抖动
+                    HStack(spacing: 10) {
                         Button(action: onDelete) {
                             Image(systemName: "xmark")
                         }
@@ -271,6 +273,8 @@ private struct ClipboardRow: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    .opacity(actionsVisible ? 1 : 0)
+                    .allowsHitTesting(actionsVisible)
                     Button(action: onCopy) {
                         Image(systemName: "square.on.square")
                             .foregroundStyle(Color.secondary)
@@ -283,9 +287,10 @@ private struct ClipboardRow: View {
                         .contentShape(Rectangle())
                         .onTapGesture(perform: onCopy)
                 } else if item.kind == .text {
-                    Text(item.text ?? item.preview)
+                    Text(item.displayText)
                         .font(.callout)
                         .lineLimit(3)
+                        .truncationMode(.tail)
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
