@@ -50,18 +50,18 @@ struct ClipboardRootView: View {
                         ClipboardRow(
                             index: index + 1,
                             item: item,
-                            selected: selectedID == item.id
-                        ) {
-                            selectedID = item.id
-                            clipboard.restore(item)
-                            state.hideClipboard()
-                        } onCopy: {
-                            clipboard.restore(item)
-                        } onDelete: {
-                            clipboard.remove(item)
-                        } onFavorite: {
-                            clipboard.toggleFavorite(item)
-                        }
+                            selected: selectedID == item.id,
+                            onCopy: {
+                                selectedID = item.id
+                                copyAndClose(item)
+                            },
+                            onDelete: {
+                                clipboard.remove(item)
+                            },
+                            onFavorite: {
+                                clipboard.toggleFavorite(item)
+                            }
+                        )
                         .onTapGesture {
                             selectedID = item.id
                         }
@@ -198,6 +198,12 @@ struct ClipboardRootView: View {
         .background(WindowDragArea())
     }
 
+    /// 复制即完成一次取用，面板随之收起并把焦点交还给原应用，省掉手动关闭。
+    private func copyAndClose(_ item: ClipboardItem) {
+        clipboard.restore(item)
+        state.hideClipboard()
+    }
+
     private var filtered: [ClipboardItem] {
         clipboard.items.filter { item in
             switch filter {
@@ -219,12 +225,10 @@ private struct ClipboardRow: View {
     let index: Int
     let item: ClipboardItem
     let selected: Bool
-    let onRestore: () -> Void
     let onCopy: () -> Void
     let onDelete: () -> Void
     let onFavorite: () -> Void
     @State private var hovered = false
-    @State private var copied = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -234,7 +238,7 @@ private struct ClipboardRow: View {
                 .lineLimit(1)
                 .foregroundStyle(.white.opacity(0.22))
                 .frame(width: 38, alignment: .trailing)
-            Button(action: onRestore) {
+            Button(action: onCopy) {
                 Image(systemName: "arrow.uturn.backward")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(.white)
@@ -243,6 +247,7 @@ private struct ClipboardRow: View {
             }
             .buttonStyle(.plain)
             .padding(.top, 4)
+            .help("复制到剪贴板并关闭面板")
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
@@ -266,28 +271,25 @@ private struct ClipboardRow: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    Button {
-                        onCopy()
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                            copied = false
-                        }
-                    } label: {
-                        Image(systemName: copied ? "checkmark" : "square.on.square")
-                            .foregroundStyle(copied ? Color.green : Color.secondary)
-                            .scaleEffect(copied ? 1.15 : 1.0)
+                    Button(action: onCopy) {
+                        Image(systemName: "square.on.square")
+                            .foregroundStyle(Color.secondary)
                     }
                     .buttonStyle(.plain)
-                    .animation(.easeInOut(duration: 0.15), value: copied)
-                    .help("复制到剪贴板")
+                    .help("复制到剪贴板并关闭面板")
                 }
                 if let path = item.previewSourcePath {
                     ThumbnailView(path: path)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: onCopy)
                 } else if item.kind == .text {
                     Text(item.text ?? item.preview)
                         .font(.callout)
                         .lineLimit(3)
                         .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: onCopy)
                 } else {
                     HStack(spacing: 8) {
                         Image(systemName: "doc")
@@ -295,6 +297,9 @@ private struct ClipboardRow: View {
                             .lineLimit(2)
                     }
                     .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onCopy)
                 }
             }
         }
@@ -330,6 +335,8 @@ private final class WindowDragNSView: NSView {
 final class ClipboardWindowController: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     private let host: NSHostingController<AnyView>
+    /// 面板是靠激活 OneBar 显示出来的；记下当时的前台应用，收起时把焦点还回去。
+    private var previousApp: NSRunningApplication?
 
     init(state: AppState) {
         let root = ClipboardRootView()
@@ -368,6 +375,7 @@ final class ClipboardWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        rememberFrontmostApp()
         centerOnScreen()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -375,7 +383,21 @@ final class ClipboardWindowController: NSObject, NSWindowDelegate {
     }
 
     func hide() {
+        guard panel.isVisible else { return }
         panel.orderOut(nil)
+        restoreFrontmostApp()
+    }
+
+    private func rememberFrontmostApp() {
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        previousApp = front
+    }
+
+    private func restoreFrontmostApp() {
+        guard let app = previousApp, !app.isTerminated else { return }
+        previousApp = nil
+        app.activate(from: .current, options: [])
     }
 
     private func centerOnScreen() {
