@@ -500,13 +500,9 @@ private struct FanPanel: View {
                 .padding(.vertical, 3)
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
             Spacer()
-            VStack(alignment: .trailing, spacing: 1) {
-                Text("全机最高")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(fan.hottestTemp.map { String(format: "%.0f°C", $0) } ?? "--")
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
+            HStack(spacing: 14) {
+                secondaryTemp("GPU", fan.gpuTemp)
+                secondaryTemp("全机最高", fan.hottestTemp)
             }
         }
         .padding(.horizontal, 14)
@@ -524,6 +520,17 @@ private struct FanPanel: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(Color.primary.opacity(0.07))
         )
+    }
+
+    private func secondaryTemp(_ label: String, _ value: Double?) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value.map { String(format: "%.0f°C", $0) } ?? "--")
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+        }
     }
 
     private var fanCard: some View {
@@ -745,17 +752,38 @@ private struct CurveControls: View {
                 .disabled(fan.curvePoints.count >= 8)
                 .opacity(fan.curvePoints.count >= 8 ? 0.4 : 1)
                 Spacer()
-                Text(String(format: "%.0f RPM", fan.curveTargetRPM))
+                Text(fan.controlTemp.map { String(format: "控制 %.1f°", $0) } ?? "控制 --")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                Text(targetText)
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
                     .padding(.horizontal, 9)
                     .padding(.vertical, 4)
-                    .background(Color.accentColor.opacity(0.14), in: Capsule())
-                    .foregroundStyle(Color.accentColor)
+                    .background(targetColor.opacity(0.14), in: Capsule())
+                    .foregroundStyle(targetColor)
             }
-            Text("按温度匹配最高满足的条件，低于全部阈值用最低转速。")
+            Text("相邻点之间按温度线性插值，转速平滑变化；低于最低点 3° 交还系统自动，回到最低点后再接管；≥90° 立即满速。控制温度取平滑后的 CPU/GPU 较高者。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var targetText: String {
+        switch fan.curveState {
+        case .released: return "系统自动"
+        case .emergency: return String(format: "满速 %.0f", fan.curveTargetRPM)
+        case .following: return String(format: "目标 %.0f RPM", fan.curveTargetRPM)
+        }
+    }
+
+    private var targetColor: Color {
+        switch fan.curveState {
+        case .released: return .secondary
+        case .emergency: return .red
+        case .following: return .accentColor
         }
     }
 }
@@ -777,8 +805,8 @@ private struct CurveRow: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            Text("≥")
-                .font(.callout)
+            Image(systemName: "circle.fill")
+                .font(.system(size: 5))
                 .foregroundStyle(.secondary)
                 .frame(width: 14)
             field($celsiusDraft, width: 46, kind: .celsius, commit: commitCelsius)

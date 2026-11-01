@@ -1,8 +1,9 @@
 import Foundation
 import AppKit
 
-// Fan control: Auto vs one shared fixed RPM. Writes on Apple Silicon need root.
-// Helper path adapted from MacsFan (MIT).
+// Fan control: Auto, one shared fixed RPM, or a temperature curve. Writes on Apple
+// Silicon need root and go through the resident helper (FanHelper.swift). SMC reads
+// stay off the main thread on `FanSensor`'s serial queue.
 
 struct FanInfo: Identifiable, Equatable {
     let id: Int
@@ -19,6 +20,8 @@ enum FanMode: String {
     case curve
 }
 
+/// Stored format is unchanged from the step-curve days ({id, celsius, rpm}); only
+/// the meaning moved from "at/above T use R" to "R at T, interpolate between".
 struct FanCurvePoint: Identifiable, Codable, Equatable {
     var id: UUID
     var celsius: Double
@@ -32,8 +35,6 @@ struct FanCurvePoint: Identifiable, Codable, Equatable {
 }
 
 enum FanCurve {
-    /// Fine-grained in 50–70°: that's the common operating band, so steps are small
-    /// (300–500 RPM). Above 70° bigger jumps are fine — that's emergency territory.
     static let defaults: [FanCurvePoint] = [
         FanCurvePoint(celsius: 50, rpm: 1700),
         FanCurvePoint(celsius: 55, rpm: 2000),
@@ -51,428 +52,414 @@ enum FanCurve {
         FanCurvePoint(celsius: 85, rpm: 5200),
     ]
 
-    /// Step-down hysteresis in °C. After entering a level at threshold T, the fan
-    /// only drops back once temp falls below T - hysteresis. Without this, temp
-    /// hovering around a threshold makes the speed flip between two levels on
-    /// every 2s sample.
-    static let dropHysteresis: Double = 2.5
-
-    /// Step-up sustain window in seconds. To step up to a level the temp must
-    /// stay continuously at/above that level's threshold for this long. Kills the
-    /// "58↔61° flip-flop": a momentary blip no longer yanks the fans up, so a
-    /// high-speed level can't turn on and off every few samples.
-    static let ascendSustain: TimeInterval = 60
-
-    /// Thresholds at/above this value ignore `ascendSustain` and step up
-    /// instantly — emergency territory, waiting there is never right.
-    static let ascendBypassCelsius: Double = 70
-
     static func sortedPoints(_ points: [FanCurvePoint]) -> [FanCurvePoint] {
         points.sorted { $0.celsius < $1.celsius }
     }
 
-    /// Highest matching threshold index; -1 means below all points (floor).
-    static func level(for temp: Double, sorted: [FanCurvePoint]) -> Int {
-        var level = -1
-        for (index, point) in sorted.enumerated() where temp >= point.celsius {
-            level = index
+    /// Linear between neighbouring points; flat at the first point's RPM below it and
+    /// at the last point's RPM above it. nil only for an empty curve.
+    static func interpolatedRPM(for temp: Double, sorted: [FanCurvePoint]) -> Double? {
+        guard let first = sorted.first, let last = sorted.last else { return nil }
+        if temp <= first.celsius { return first.rpm }
+        if temp >= last.celsius { return last.rpm }
+        for (lo, hi) in zip(sorted, sorted.dropFirst()) where temp <= hi.celsius {
+            let span = hi.celsius - lo.celsius
+            guard span > 0.01 else { return hi.rpm }
+            return lo.rpm + (hi.rpm - lo.rpm) * (temp - lo.celsius) / span
         }
-        return level
+        return last.rpm
     }
 
-    /// Hysteresis-aware level: down from `currentLevel` waits until temp is
-    /// `hysteresis` below that level's entry threshold. Stale levels (curve
-    /// shrank after an edit) bypass the hold. Stepping up is NOT handled here —
-    /// see `ascentTick`, which gates ascents behind a sustain window.
-    static func stableLevel(
-        for temp: Double,
-        sorted: [FanCurvePoint],
-        currentLevel: Int,
-        hysteresis: Double
-    ) -> Int {
-        let raw = level(for: temp, sorted: sorted)
-        guard raw < currentLevel, currentLevel >= 0, currentLevel < sorted.count else { return raw }
-        return temp >= sorted[currentLevel].celsius - hysteresis ? currentLevel : raw
-    }
-
-    /// One tick of the step-up sustain state machine. When raw level wants to go
-    /// higher than `currentLevel`, hold the current level until temp has been
-    /// continuously at/above the target threshold for `sustain` seconds; entry
-    /// thresholds at/above `bypassCelsius` skip straight up. Returns the level to
-    /// use plus the pending wait, if any, to carry into the next tick.
-    static func ascentTick(
-        rawLevel: Int,
-        currentLevel: Int,
-        sorted: [FanCurvePoint],
-        entry: Double?,
-        since: Date?,
-        now: Date,
-        sustain: TimeInterval,
-        bypassCelsius: Double
-    ) -> (level: Int, entry: Double?, since: Date?) {
-        guard rawLevel > currentLevel else { return (currentLevel, nil, nil) }
-        let targetEntry = sorted[rawLevel].celsius
-        if targetEntry >= bypassCelsius { return (rawLevel, nil, nil) }
-        if entry == targetEntry, let since {
-            if now.timeIntervalSince(since) >= sustain {
-                return (rawLevel, nil, nil)
-            }
-            return (currentLevel, targetEntry, since)
+    static func decodeStored(_ data: Data) -> [FanCurvePoint]? {
+        guard let points = try? JSONDecoder().decode([FanCurvePoint].self, from: data),
+              !points.isEmpty else { return nil }
+        // A stored curve identical to the pre-50–70° defaults was never customized;
+        // move it to the finer defaults instead of pinning the old coarse one.
+        if points.count == legacyDefaults.count,
+           zip(points, legacyDefaults).allSatisfy({
+               abs($0.celsius - $1.celsius) < 0.5 && abs($0.rpm - $1.rpm) < 1
+           }) {
+            return defaults
         }
-        return (currentLevel, targetEntry, now)
-    }
-
-    static func rpm(level: Int, sorted: [FanCurvePoint], floor: Double) -> Double {
-        level < 0 ? floor : sorted[level].rpm
-    }
-
-    /// Highest matching threshold; below all points uses `floor`.
-    static func rpm(for temp: Double, points: [FanCurvePoint], floor: Double) -> Double {
-        let sorted = sortedPoints(points)
-        return rpm(level: level(for: temp, sorted: sorted), sorted: sorted, floor: floor)
-    }
-
-    static func runSelfTest() -> Int32 {
-        let points = [
-            FanCurvePoint(celsius: 50, rpm: 2000),
-            FanCurvePoint(celsius: 70, rpm: 4000),
-            FanCurvePoint(celsius: 85, rpm: 5700),
-        ]
-        let cases: [(Double, Double)] = [
-            (40, 1200), (50, 2000), (73, 4000), (85, 5700), (90, 5700),
-        ]
-        for (temp, expected) in cases {
-            let got = rpm(for: temp, points: points, floor: 1200)
-            if got != expected {
-                fputs("curve selftest failed: \(temp) -> \(got) expected \(expected)\n", stderr)
-                return 1
-            }
-        }
-        if rpm(for: 60, points: [], floor: 1200) != 1200 {
-            fputs("curve selftest failed: empty points\n", stderr)
-            return 1
-        }
-
-        // Hysteresis: step up instantly, hold on the way down until temp clears
-        // the entry threshold minus hysteresis.
-        let sorted = sortedPoints([
-            FanCurvePoint(celsius: 50, rpm: 2000),
-            FanCurvePoint(celsius: 55, rpm: 2400),
-            FanCurvePoint(celsius: 60, rpm: 2900),
-            FanCurvePoint(celsius: 65, rpm: 3500),
-            FanCurvePoint(celsius: 70, rpm: 4200),
-        ])
-        let hysteresisCases: [(Double, Int, Int)] = [
-            (49.9, -1, -1), // below all: floor, nothing to hold
-            (61.0, 1, 2),   // crossed 60: up immediately
-            (58.5, 2, 2),   // 58.5 >= 60 - 2.5: hold level 2
-            (57.4, 2, 1),   // 57.4 < 57.5: released to raw level
-            (66.0, 2, 3),   // up across 65
-            (45.0, 9, -1),  // stale level past the last point: raw
-        ]
-        for (temp, current, expected) in hysteresisCases {
-            let got = stableLevel(for: temp, sorted: sorted, currentLevel: current, hysteresis: 2.5)
-            if got != expected {
-                fputs("curve selftest failed: hysteresis \(temp)@L\(current) -> L\(got) expected L\(expected)\n", stderr)
-                return 1
-            }
-        }
-
-        // Ascend sustain: temp must hold over the target threshold before the
-        // fan steps up; a stray 61° blip among 58–59° must not trigger it.
-        let t0 = Date()
-        let tick = { (raw: Int, cur: Int, entry: Double?, since: Date?, now: Date) -> (Int, Double?, Date?) in
-            let s = ascentTick(
-                rawLevel: raw, currentLevel: cur, sorted: sorted,
-                entry: entry, since: since, now: now,
-                sustain: 60, bypassCelsius: 70
-            )
-            return (s.level, s.entry, s.since)
-        }
-        var s = tick(2, -1, nil, nil, t0) // 61° start: target 60°, begin wait
-        if s.0 != -1 || s.1 != 60 || s.2 != t0 {
-            fputs("curve selftest failed: sustain start L\(s.0) \(String(describing: s.1))\n", stderr)
-            return 1
-        }
-        s = tick(2, -1, s.1, s.2, t0 + 10) // 10s in: still holding
-        if s.0 != -1 || s.1 != 60 || s.2 != t0 {
-            fputs("curve selftest failed: sustain hold L\(s.0)\n", stderr)
-            return 1
-        }
-        s = tick(2, -1, s.1, s.2, t0 + 60) // 60s in: release to 60° level
-        if s.0 != 2 || s.1 != nil || s.2 != nil {
-            fputs("curve selftest failed: sustain release L\(s.0)\n", stderr)
-            return 1
-        }
-        s = tick(4, 0, nil, nil, t0) // 70° (bypass) target: immediate
-        if s.0 != 4 || s.1 != nil {
-            fputs("curve selftest failed: bypass L\(s.0)\n", stderr)
-            return 1
-        }
-        s = tick(2, -1, 65, t0, t0 + 5) // target drifted 65→60 mid-hold: restart
-        if s.0 != -1 || s.1 != 60 || s.2 != t0 + 5 {
-            fputs("curve selftest failed: sustain restart L\(s.0)\n", stderr)
-            return 1
-        }
-        s = tick(1, 2, 60, t0, t0) // descending: gate idle
-        if s.0 != 2 || s.1 != nil {
-            fputs("curve selftest failed: sustain idle L\(s.0)\n", stderr)
-            return 1
-        }
-        return 0
+        return points
     }
 }
 
-enum PrivilegedWriter {
-    static var executablePath: String {
-        Bundle.main.executablePath ?? CommandLine.arguments[0]
-    }
+/// Spike filter + asymmetric EMA for one temperature source.
+///
+/// Measured on this M1 Pro (max of all Tp/Te keys, 1 s sampling): idle stdev 2.2°,
+/// 2 s range 7.5°, single-sample jumps up to 12° that revert next sample; GPU (Tg)
+/// is calmer (stdev 0.7°). Median-of-3 removes one-sample spikes outright; the EMA
+/// then follows rises with τ=4 s (a real 61→84° load step crosses 75° in ~12 s)
+/// and falls with τ=20 s, so a brief dip doesn't spin the fans down only to spin
+/// them up again. Simulated at the app's 2 s cadence this cut idle range from 7.5°
+/// to 2.3° (stdev 2.1° → 0.66°).
+struct TempSmoother {
+    static let tauUp: TimeInterval = 4
+    static let tauDown: TimeInterval = 20
+    /// A gap this long (sleep, module off) makes the old state meaningless.
+    static let resetGap: TimeInterval = 30
 
-    /// Serialize every sudo helper run: two concurrent root SMC writers make writes fail intermittently.
-    private static let queue = DispatchQueue(label: "onebar.fan.helper")
-    private static let logURL = FileManager.default
-        .urls(for: .libraryDirectory, in: .userDomainMask).first?
-        .appendingPathComponent("Logs/OneBar-fan.log")
-
-    struct Outcome {
-        var ok: Bool
-        var detail: String
-    }
-
-    static func hasPasswordlessSudo() -> Bool {
-        let result = runProcess("/usr/bin/sudo", ["-n", executablePath, "helper"])
-        let err = result.stderr.lowercased()
-        if (err.contains("password") && !err.contains("usage")) || err.contains("a terminal is required") {
-            return false
-        }
-        return err.contains("usage") || result.status == 0 || result.status == 1
-    }
-
-    static func ensureAuthorized() -> Bool {
-        if hasPasswordlessSudo() { return true }
-        guard installSudoers() else { return false }
-        return hasPasswordlessSudo()
-    }
-
-    static func setAllFixed(rpm: Double, promptIfNeeded: Bool = true) -> Outcome {
-        runHelper(["all", String(format: "%.0f", rpm)], promptIfNeeded: promptIfNeeded)
-    }
-
-    static func setAllAuto(promptIfNeeded: Bool = true) -> Outcome {
-        runHelper(["all", "auto"], promptIfNeeded: promptIfNeeded)
-    }
-
-    static func setAllAutoSilently() {
-        _ = runProcess("/usr/bin/sudo", ["-n", executablePath, "helper", "all", "auto"])
-    }
-
-    private static func appendLog(_ line: String) {
-        guard let logURL else { return }
-        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let entry = "[\(stamp)] \(line)\n"
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data(entry.utf8))
-        } else {
-            try? Data(entry.utf8).write(to: logURL, options: .atomic)
-        }
-    }
-
-    private static func runHelper(_ helperArgs: [String], promptIfNeeded: Bool) -> Outcome {
-        if promptIfNeeded {
-            guard ensureAuthorized() else { return Outcome(ok: false, detail: "未授权") }
-        } else if !hasPasswordlessSudo() {
-            return Outcome(ok: false, detail: "未授权")
-        }
-        let result = queue.sync {
-            runProcess("/usr/bin/sudo", ["-n", executablePath, "helper"] + helperArgs)
-        }
-        if result.status == 0 { return Outcome(ok: true, detail: "") }
-        appendLog("helper \(helperArgs.joined(separator: " ")) -> status \(result.status.map(String.init) ?? "nil"): \(result.stderr)")
-        let detail = result.stderr
-            .split(separator: "\n")
-            .filter { !$0.localizedCaseInsensitiveContains("usage") }
-            .joined(separator: " / ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Outcome(ok: false, detail: String(detail.prefix(100)))
-    }
-
-    /// One-time: write /etc/sudoers.d/onebar so later fan switches use `sudo -n`.
-    private static func installSudoers() -> Bool {
-        if Thread.isMainThread {
-            NSApp.activate(ignoringOtherApps: true)
-        } else {
-            DispatchQueue.main.sync {
-                NSApp.activate(ignoringOtherApps: true)
-            }
-        }
-        let user = NSUserName()
-        let path = executablePath
-        let line = "\(user) ALL=(root) NOPASSWD: \(path)"
-        let shell = "printf '%s\\n' '\(line)' > /etc/sudoers.d/onebar && chmod 440 /etc/sudoers.d/onebar && visudo -cf /etc/sudoers.d/onebar"
-        let escaped = shell
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "do shell script \"\(escaped)\" with administrator privileges"
-        return runProcess("/usr/bin/osascript", ["-e", script]).status == 0
-    }
-
-    private struct ProcResult {
-        var status: Int32?
-        var stderr: String
-    }
+    private var window: [Double] = []
+    private(set) var value: Double?
+    private var last: Date?
 
     @discardableResult
-    private static func runProcess(_ launchPath: String, _ arguments: [String]) -> ProcResult {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: launchPath)
-        task.arguments = arguments
-        let err = Pipe()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = err
-        do { try task.run() } catch { return ProcResult(status: nil, stderr: error.localizedDescription) }
-        task.waitUntilExit()
-        let data = err.fileHandleForReading.readDataToEndOfFile()
-        return ProcResult(status: task.terminationStatus, stderr: String(data: data, encoding: .utf8) ?? "")
+    mutating func update(_ raw: Double?, at now: Date) -> Double? {
+        guard let raw else { return value }
+        if let last, now.timeIntervalSince(last) > Self.resetGap { reset() }
+        let dt = last.map { min(max(now.timeIntervalSince($0), 0), 10) } ?? 0
+        last = now
+        window.append(raw)
+        if window.count > 3 { window.removeFirst() }
+        let filtered = window.sorted()[(window.count - 1) / 2]
+        guard let previous = value else {
+            value = filtered
+            return value
+        }
+        let tau = filtered > previous ? Self.tauUp : Self.tauDown
+        value = previous + (1 - exp(-dt / tau)) * (filtered - previous)
+        return value
+    }
+
+    mutating func reset() {
+        window.removeAll()
+        value = nil
+        last = nil
     }
 }
 
-enum HelperCLI {
-    static func run(_ argv: [String]) -> Int32 {
-        // OneBar helper all <rpm|auto>
-        // OneBar helper <index> <rpm|auto>
-        guard argv.count >= 4, argv[1] == "helper" else {
-            fputs("Usage: OneBar helper <fan_index|all> <rpm|auto>\n", stderr)
-            return 1
-        }
-        let smc = SMC()
-        guard smc.open() else {
-            fputs("OneBar: cannot open AppleSMC\n", stderr)
-            return 1
-        }
-        defer { smc.close() }
+/// Curve-mode state machine: smoothed temp → interpolated target → rate-limited
+/// command, plus hand-back to the system below the curve and an emergency bypass on
+/// the real (unsmoothed) temperature. Pure value type so selftest can drive it.
+struct CurveEngine {
+    enum Phase: Equatable {
+        /// Fresh (mode entered, wake, module re-enabled): decide on the next step.
+        case starting
+        case controlling
+        case released
+    }
 
-        let count = Int(smc.readDouble("FNum") ?? 0)
-        guard count > 0 else {
-            fputs("OneBar: SMC reports no fans\n", stderr)
-            return 1
-        }
-        let target = argv[2]
-        let indices: [Int]
-        if target == "all" {
-            indices = Array(0..<count)
-        } else if let idx = Int(target), (0...9).contains(idx) {
-            indices = [idx]
-        } else {
-            fputs("OneBar: bad fan index\n", stderr)
-            return 1
+    enum Action: Equatable {
+        case none
+        case write(Double)
+        case release
+    }
+
+    /// Hand the fans back to the system once smoothed temp is this far below the lowest point.
+    static let handoverMargin: Double = 3
+    /// Minimum time in a phase before switching controlling ↔ released (unless emergency).
+    static let handoverDwell: TimeInterval = 30
+    /// Temp used for the curve follows rises at once but only follows a fall after it
+    /// exceeds this, so ±1–2° wobble of the smoothed value doesn't move the target.
+    static let dropHysteresis: Double = 2
+    /// Real temp at/above this on `emergencySamples` consecutive samples → max RPM,
+    /// skipping smoothing and ramp. Two samples (≈2 s apart) so one 12° spike can't trip it.
+    static let emergencyCelsius: Double = 90
+    static let emergencySamples = 2
+    /// Leave emergency once both real and smoothed temp are below this and it held ≥ `emergencyHold`.
+    static let emergencyExitCelsius: Double = 85
+    static let emergencyHold: TimeInterval = 10
+    /// RPM per second. At the 2 s cadence: +600 / −200 per tick. Rising fast matters for
+    /// heat; falling slowly is what makes the change inaudible.
+    static let rampUpPerSecond: Double = 300
+    static let rampDownPerSecond: Double = 100
+    /// Commands closer than this to the last written value aren't sent.
+    static let writeDeadband: Double = 100
+
+    private(set) var phase: Phase = .starting
+    private(set) var phaseSince = Date.distantPast
+    private(set) var heldTemp: Double?
+    /// Interpolated (pre-ramp) target; nil while released.
+    private(set) var target: Double?
+    /// Ramp output — what we want the fans at right now.
+    private(set) var commanded: Double?
+    private(set) var lastWritten: Double?
+    private(set) var emergency = false
+    private var emergencySince = Date.distantPast
+    private var hotStreak = 0
+    private var lastStep: Date?
+    private var releasePending = false
+
+    mutating func step(
+        smoothed: Double?,
+        raw: Double?,
+        now: Date,
+        sorted: [FanCurvePoint],
+        minRPM: Double,
+        maxRPM: Double,
+        currentRPM: Double?
+    ) -> Action {
+        let dt = lastStep.map { min(max(now.timeIntervalSince($0), 0), 4) } ?? 2
+        lastStep = now
+        guard let smoothed, let lowest = sorted.first?.celsius else { return .none }
+
+        if let raw, raw >= Self.emergencyCelsius { hotStreak += 1 } else { hotStreak = 0 }
+        if hotStreak >= Self.emergencySamples {
+            if !emergency { emergencySince = now }
+            emergency = true
+        } else if emergency,
+                  smoothed < Self.emergencyExitCelsius,
+                  (raw ?? 0) < Self.emergencyExitCelsius,
+                  now.timeIntervalSince(emergencySince) >= Self.emergencyHold {
+            emergency = false
         }
 
-        if argv[3] == "auto" {
-            var ok = true
-            for i in indices {
-                if !releaseToAuto(smc, fanIndex: i) {
-                    fputs("OneBar: failed to release fan \(i) to auto\n", stderr)
-                    ok = false
+        let dwellDone = now.timeIntervalSince(phaseSince) >= Self.handoverDwell
+        switch phase {
+        case .starting:
+            if !emergency, smoothed < lowest - Self.handoverMargin {
+                return enterReleased(now)
+            }
+            enterControlling(now, smoothed: smoothed)
+        case .released:
+            if emergency || (smoothed >= lowest && dwellDone) {
+                enterControlling(now, smoothed: smoothed)
+            } else {
+                if releasePending {
+                    releasePending = false
+                    return .release
                 }
+                return .none
             }
-            if smc.keyInfo("Ftst") != nil {
-                _ = smc.writeDouble("Ftst", value: 0)
+        case .controlling:
+            if !emergency, smoothed < lowest - Self.handoverMargin, dwellDone {
+                return enterReleased(now)
             }
-            return ok ? 0 : 1
         }
 
-        guard let rpm = Double(argv[3]), rpm >= 0, rpm <= 20000 else {
-            fputs("OneBar: rpm out of range\n", stderr)
-            return 1
+        if let held = heldTemp, smoothed < held {
+            if smoothed < held - Self.dropHysteresis { heldTemp = smoothed + Self.dropHysteresis }
+        } else {
+            heldTemp = smoothed
         }
+        let curveRPM = FanCurve.interpolatedRPM(for: heldTemp ?? smoothed, sorted: sorted) ?? minRPM
+        let goal = emergency ? maxRPM : min(max(curveRPM, minRPM), maxRPM)
+        target = goal
 
-        var ok = true
-        for i in indices {
-            let minRPM = smc.readDouble("F\(i)Mn") ?? 0
-            let maxRPM = smc.readDouble("F\(i)Mx") ?? rpm
-            let clamped = min(max(rpm, minRPM), maxRPM)
-            if modeKey(smc, fanIndex: i) != nil, !setManual(smc, fanIndex: i) {
-                fputs("OneBar: manual mode rejected for fan \(i)\n", stderr)
-                ok = false
-                continue
-            }
-            if var flags = smc.readUInt8("FS! ") {
-                flags |= (1 << i)
-                _ = smc.writeData("FS! ", bytes: [flags, 0])
-            }
-            let key = "F\(i)Tg"
-            var accepted = false
-            let deadline = Date().addingTimeInterval(3)
-            while Date() < deadline {
-                accepted = smc.writeDouble(key, value: clamped)
-                if let after = smc.readDouble(key), abs(after - clamped) < 2 { break }
-                usleep(150_000)
-            }
-            if !accepted {
-                fputs("OneBar: SMC rejected write to \(key)\n", stderr)
-                ok = false
-            }
+        let start = min(max(commanded ?? currentRPM ?? minRPM, minRPM), maxRPM)
+        let next: Double
+        if emergency {
+            next = goal
+        } else if goal > start {
+            next = min(goal, start + Self.rampUpPerSecond * dt)
+        } else {
+            next = max(goal, start - Self.rampDownPerSecond * dt)
         }
-        return ok ? 0 : 1
+        commanded = next
+        if let lastWritten, abs(next - lastWritten) < Self.writeDeadband { return .none }
+        lastWritten = next
+        return .write(next)
     }
 
-    private static func modeKey(_ smc: SMC, fanIndex: Int) -> String? {
-        ["F\(fanIndex)Md", "F\(fanIndex)md"].first { smc.keyInfo($0) != nil }
+    /// Force the next step to write even inside the deadband (fans drifted, write failed).
+    mutating func invalidate() {
+        lastWritten = nil
     }
 
-    /// Manual is mode 1. Auto is 0; Apple Silicon thermalmonitord uses 3 (system). Both 0 and 3 mean "not ours".
-    private static func isHeldManual(_ smc: SMC, fanIndex: Int) -> Bool {
-        guard let mk = modeKey(smc, fanIndex: fanIndex) else { return false }
-        return smc.readUInt8(mk) == 1
+    mutating func writeFailed() {
+        lastWritten = nil
     }
 
-    private static func setManual(_ smc: SMC, fanIndex: Int) -> Bool {
-        guard let mk = modeKey(smc, fanIndex: fanIndex) else { return true }
-        if smc.readUInt8(mk) == 1 { return true }
-        let hasTst = smc.keyInfo("Ftst") != nil
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            _ = smc.writeDouble(mk, value: 1)
-            if hasTst { _ = smc.writeDouble("Ftst", value: 1) }
-            if smc.readUInt8(mk) == 1 { return true }
-            usleep(120_000)
-        }
-        return smc.readUInt8(mk) == 1
+    mutating func releaseFailed() {
+        if phase == .released { releasePending = true }
     }
 
-    private static func releaseToAuto(_ smc: SMC, fanIndex: Int) -> Bool {
-        if var flags = smc.readUInt8("FS! ") {
-            flags &= ~(1 << fanIndex)
-            _ = smc.writeData("FS! ", bytes: [flags, 0])
+    mutating func reset() {
+        self = CurveEngine()
+    }
+
+    private mutating func enterReleased(_ now: Date) -> Action {
+        phase = .released
+        phaseSince = now
+        target = nil
+        commanded = nil
+        lastWritten = nil
+        heldTemp = nil
+        releasePending = false
+        return .release
+    }
+
+    private mutating func enterControlling(_ now: Date, smoothed: Double) {
+        phase = .controlling
+        phaseSince = now
+        heldTemp = smoothed
+        commanded = nil
+        lastWritten = nil
+    }
+}
+
+/// Which SMC temperature keys feed what. Families with a lowercase second letter are
+/// the SoC's on-die sensors; on this M1 Pro they all rose 9–26° under an all-core load.
+/// Uppercase families are board/peripheral sensors (TB battery, TA/Ta ambient & airflow,
+/// TH SSD, TD/TP/TR/TV/TS/TW power rails, regulators, Wi-Fi…): ±0–2° under the same load
+/// or obviously not die temps, so they're kept out of "全机最高". TG* (battery gauge,
+/// `ioft`) doesn't even decode. Tz* reads 0.
+enum TempKeys {
+    enum Kind {
+        case cpu
+        case gpu
+        case chip
+    }
+
+    static func kind(of key: String) -> Kind? {
+        guard key.utf8.count == 4, key.hasPrefix("T") else { return nil }
+        switch key.prefix(2) {
+        case "Tp", "Te": return .cpu   // P-core / E-core clusters
+        case "Tg": return .gpu
+        case "Tm", "Ts", "Th", "Td": return .chip
+        default: return nil
         }
-        guard let mk = modeKey(smc, fanIndex: fanIndex) else { return true }
-        if !isHeldManual(smc, fanIndex: fanIndex) { return true }
-        _ = smc.writeDouble(mk, value: 0)
-        if !isHeldManual(smc, fanIndex: fanIndex) { return true }
-        if smc.keyInfo("Ftst") != nil {
-            _ = smc.writeDouble("Ftst", value: 0)
+    }
+
+    static func plausible(_ value: Double) -> Bool {
+        value > 1 && value < 125
+    }
+}
+
+struct FanSample {
+    var connected = false
+    /// nil when this read failed; keep showing the previous fans.
+    var fans: [FanInfo]?
+    var fanError: String?
+    var cpu: Double?
+    var gpu: Double?
+    var hottest: Double?
+}
+
+/// Owns the read-only SMC connection. Every call runs on `queue`, so the SMC instance
+/// is never touched from two threads.
+final class FanSensor: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "onebar.fan.smc", qos: .utility)
+    private let smc = SMC()
+    private var discovered = false
+    private var cpuKeys: [String] = []
+    private var gpuKeys: [String] = []
+    private var chipKeys: [String] = []
+    private var fans: [FanInfo] = []
+    private var readFailStreak = 0
+
+    func sample(_ completion: @escaping @Sendable (FanSample) -> Void) {
+        queue.async { [self] in completion(read()) }
+    }
+
+    private func read() -> FanSample {
+        var sample = FanSample()
+        guard smc.open() else { return sample }
+        sample.connected = true
+        if !discovered {
+            discovered = true
+            discoverTemps()
+            sample.fanError = loadFans()
+        } else if refreshFans() {
+            readFailStreak = 0
+        } else {
+            readFailStreak += 1
+            if readFailStreak >= 3 {
+                // Fan values frozen/gone usually means the SMC connection went stale; rebuild it.
+                readFailStreak = 0
+                smc.close()
+                if smc.open() { _ = loadFans() }
+            }
         }
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline {
-            _ = smc.writeDouble(mk, value: 0)
-            if !isHeldManual(smc, fanIndex: fanIndex) { return true }
-            usleep(100_000)
+        if !fans.isEmpty { sample.fans = fans }
+        sample.cpu = maxTemp(cpuKeys)
+        sample.gpu = maxTemp(gpuKeys)
+        sample.hottest = [sample.cpu, sample.gpu, maxTemp(chipKeys)].compactMap { $0 }.max()
+        return sample
+    }
+
+    private func maxTemp(_ keys: [String]) -> Double? {
+        keys.compactMap { smc.readDouble($0) }.filter(TempKeys.plausible).max()
+    }
+
+    private func discoverTemps() {
+        let count = min(smc.keyCount(), 4000)
+        for i in 0..<count {
+            guard let key = smc.key(atIndex: i), let kind = TempKeys.kind(of: key) else { continue }
+            guard let value = smc.readDouble(key), TempKeys.plausible(value) else { continue }
+            switch kind {
+            case .cpu: cpuKeys.append(key)
+            case .gpu: gpuKeys.append(key)
+            case .chip: chipKeys.append(key)
+            }
         }
-        return !isHeldManual(smc, fanIndex: fanIndex)
+    }
+
+    /// nil on success, else the message to show.
+    private func loadFans() -> String? {
+        guard let count = smc.readDouble("FNum"), count > 0 else { return "没有风扇（无风扇机型）" }
+        let fresh = (0..<Int(count)).compactMap { index -> FanInfo? in
+            guard let actual = smc.readDouble("F\(index)Ac"),
+                  let minRPM = smc.readDouble("F\(index)Mn"),
+                  let maxRPM = smc.readDouble("F\(index)Mx") else { return nil }
+            return FanInfo(
+                id: index,
+                actualRPM: actual,
+                minRPM: minRPM,
+                maxRPM: maxRPM,
+                targetRPM: smc.readDouble("F\(index)Tg") ?? actual,
+                isManual: readManualFlag(index: index) ?? false
+            )
+        }
+        guard !fresh.isEmpty else { return "没有风扇（无风扇机型）" }
+        fans = fresh
+        return nil
+    }
+
+    private func readManualFlag(index: Int) -> Bool? {
+        if let flags = smc.readUInt8("FS! ") {
+            return (flags & (1 << index)) != 0
+        }
+        if let mode = smc.readUInt8("F\(index)Md") ?? smc.readUInt8("F\(index)md") {
+            return mode == 1
+        }
+        return nil
+    }
+
+    private func refreshFans() -> Bool {
+        var any = false
+        for i in fans.indices {
+            let idx = fans[i].id
+            if let actual = smc.readDouble("F\(idx)Ac"), actual >= 0, actual <= fans[i].maxRPM * 1.5 + 1000 {
+                fans[i].actualRPM = actual
+                any = true
+            }
+            if let target = smc.readDouble("F\(idx)Tg") {
+                fans[i].targetRPM = target
+                any = true
+            }
+            if let manual = readManualFlag(index: idx) {
+                fans[i].isManual = manual
+                any = true
+            }
+        }
+        return any
     }
 }
 
 @MainActor
 final class FanController: ObservableObject {
+    enum CurveState: Equatable {
+        case following
+        case released
+        case emergency
+    }
+
     private static let modeKey = "onebar.fan.mode"
     private static let rpmKey = "onebar.fan.rpm"
     private static let curveKey = "onebar.fan.curve"
+    private static let sampleInterval: TimeInterval = 2
 
     @Published var fans: [FanInfo] = []
-    @Published var cpuTemp: Double?
-    @Published var hottestTemp: Double?
+    /// Display temps, rounded to whole degrees so a 0.1° wobble doesn't republish the UI.
+    @Published private(set) var cpuTemp: Double?
+    @Published private(set) var gpuTemp: Double?
+    @Published private(set) var hottestTemp: Double?
+    /// Smoothed max(CPU, GPU) — what the curve acts on.
+    @Published private(set) var controlTemp: Double?
+    @Published private(set) var curveTargetRPM: Double = 0
+    @Published private(set) var curveState: CurveState = .following
     @Published var isConnected = false
     @Published var errorMessage: String?
     @Published var needsAdmin = false
@@ -485,24 +472,28 @@ final class FanController: ObservableObject {
     @Published var fixedRPM: Double
     @Published var curvePoints: [FanCurvePoint]
     @Published var applying = false
-    @Published private(set) var curveTargetRPM: Double = 0
 
-    private let smc = SMC()
+    private let sensor = FanSensor()
     private var timer: Timer?
+    private var active = true
+    private var sleeping = false
+    private var sampleInFlight = false
+    private var cpuSmoother = TempSmoother()
+    private var gpuSmoother = TempSmoother()
+    private var hottestSmoother = TempSmoother()
+    private var smoothedControl: Double?
+    private var rawControl: Double?
+    private var engine = CurveEngine()
+    /// Apply the current mode once fresh readings arrive (launch, wake, re-enable).
+    private var takeoverPending = true
     private var lastReapply = Date.distantPast
-    private var lastAppliedRPM: Double?
-    private var curveLevel = -1
-    private var ascendEntry: Double?
-    private var ascendSince: Date?
+    private var lastWriteDone = Date.distantPast
+    private var retryAfter = Date.distantPast
     private var applyGeneration = 0
     private var writeInFlightGeneration: Int?
-    private var readFailStreak = 0
-    private var lastSilentCurveApply = Date.distantPast
-    private var cpuKeys: [String] = []
-    private var tempKeys: [String] = []
     private var isEditingSpeed = false
     private var speedEditBegan = Date.distantPast
-    private var curveDebounce: DispatchWorkItem?
+    private var observers: [NSObjectProtocol] = []
 
     var sliderMin: Double {
         fans.map(\.minRPM).min() ?? 1200
@@ -529,44 +520,18 @@ final class FanController: ObservableObject {
         let rpm = UserDefaults.standard.object(forKey: Self.rpmKey) as? Double ?? 5000
         fixedRPM = rpm
         curvePoints = Self.loadCurve()
-        passwordless = PrivilegedWriter.hasPasswordlessSudo()
-        if smc.open() {
-            isConnected = true
-            loadFans()
-            tick()
-            timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.tick() }
-            }
-            DispatchQueue.main.async { [weak self] in
-                self?.discoverTemps()
-                self?.refreshTemps()
-                self?.refreshCurveTarget()
-                if self?.mode == .fixed {
-                    self?.applyFixed(silent: true)
-                } else if self?.mode == .curve {
-                    self?.applyCurveIfNeeded(force: true, silent: true)
-                }
-            }
-        } else {
-            errorMessage = "找不到 SMC（需要实体 Mac）"
+        Task.detached(priority: .utility) { [weak self] in
+            let ok = PrivilegedWriter.hasPasswordlessSudo()
+            await MainActor.run { [weak self] in self?.passwordless = ok }
         }
+        observePower()
+        startTimer()
+        requestSample()
     }
 
     private static func loadCurve() -> [FanCurvePoint] {
-        guard let data = UserDefaults.standard.data(forKey: curveKey),
-              let points = try? JSONDecoder().decode([FanCurvePoint].self, from: data),
-              !points.isEmpty else {
-            return FanCurve.defaults
-        }
-        // A stored curve identical to the pre-50–70° defaults was never customized;
-        // move it to the finer defaults instead of pinning the old coarse one.
-        if points.count == FanCurve.legacyDefaults.count,
-           zip(points, FanCurve.legacyDefaults).allSatisfy({
-               abs($0.celsius - $1.celsius) < 0.5 && abs($0.rpm - $1.rpm) < 1
-           }) {
-            return FanCurve.defaults
-        }
-        return points
+        guard let data = UserDefaults.standard.data(forKey: curveKey) else { return FanCurve.defaults }
+        return FanCurve.decodeStored(data) ?? FanCurve.defaults
     }
 
     private func persistRPM() {
@@ -579,163 +544,241 @@ final class FanController: ObservableObject {
         }
     }
 
-    private func loadFans(reset: Bool = true) {
-        guard let count = smc.readDouble("FNum"), count > 0 else {
-            if reset { errorMessage = "没有风扇（无风扇机型）" }
+    // MARK: Module on/off
+
+    /// false: stop sampling and every write, hand the fans back to the system and stop
+    /// the root helper (in the background). true: resume sampling and re-take control
+    /// per the current mode.
+    func setActive(_ on: Bool) {
+        guard on != active else { return }
+        active = on
+        if on {
+            PrivilegedWriter.resume()
+            engine.reset()
+            takeoverPending = true
+            retryAfter = .distantPast
+            startTimer()
+            requestSample()
             return
         }
-        let fresh = (0..<Int(count)).compactMap { index -> FanInfo? in
-            guard let actual = smc.readDouble("F\(index)Ac"),
-                  let minRPM = smc.readDouble("F\(index)Mn"),
-                  let maxRPM = smc.readDouble("F\(index)Mx") else { return nil }
-            return FanInfo(
-                id: index,
-                actualRPM: actual,
-                minRPM: minRPM,
-                maxRPM: maxRPM,
-                targetRPM: smc.readDouble("F\(index)Tg") ?? actual,
-                isManual: readManualFlag(index: index) ?? false
-            )
+        timer?.invalidate()
+        timer = nil
+        applyGeneration += 1
+        writeInFlightGeneration = nil
+        applying = false
+        takeoverPending = false
+        engine.reset()
+        let release = mode != .auto || fans.contains(where: \.isManual)
+        PrivilegedWriter.suspend()
+        Task.detached(priority: .utility) {
+            PrivilegedWriter.deactivate(release: release)
         }
-        guard !fresh.isEmpty else {
-            if reset { errorMessage = "没有风扇（无风扇机型）" }
-            return
-        }
-        errorMessage = nil
-        fans = fresh
     }
 
-    private func readManualFlag(index: Int) -> Bool? {
-        if let flags = smc.readUInt8("FS! ") {
-            return (flags & (1 << index)) != 0
+    private func startTimer() {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: Self.sampleInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.requestSample() }
         }
-        if let mode = smc.readUInt8("F\(index)Md") ?? smc.readUInt8("F\(index)md") {
-            return mode == 1
-        }
-        return nil
+        timer.tolerance = 0.3
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
-    @discardableResult
-    private func refreshFanReadings() -> Bool {
-        var any = false
-        for i in fans.indices {
-            let idx = fans[i].id
-            if let actual = smc.readDouble("F\(idx)Ac"), actual >= 0, actual <= fans[i].maxRPM * 1.5 + 1000 {
-                fans[i].actualRPM = actual
-                any = true
-            }
-            if let target = smc.readDouble("F\(idx)Tg") {
-                fans[i].targetRPM = target
-                any = true
-            }
-            if let manual = readManualFlag(index: idx) {
-                fans[i].isManual = manual
-                any = true
-            }
-        }
-        return any
+    private func observePower() {
+        let center = NSWorkspace.shared.notificationCenter
+        observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleWillSleep() }
+        })
+        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleDidWake() }
+        })
     }
 
-    private func tick() {
-        if refreshFanReadings() {
-            readFailStreak = 0
+    /// Hand back to the system before sleeping; a manual speed held through sleep/wake
+    /// is exactly how fans end up stuck. Waits briefly so it lands before the system sleeps.
+    private func handleWillSleep() {
+        sleeping = true
+        applyGeneration += 1
+        writeInFlightGeneration = nil
+        applying = false
+        engine.reset()
+        guard active else { return }
+        PrivilegedWriter.suspend()
+        let release = mode != .auto || fans.contains(where: \.isManual)
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            PrivilegedWriter.deactivate(release: release)
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 3)
+    }
+
+    private func handleDidWake() {
+        sleeping = false
+        if active { PrivilegedWriter.resume() }
+        cpuSmoother.reset()
+        gpuSmoother.reset()
+        hottestSmoother.reset()
+        engine.reset()
+        guard active else { return }
+        takeoverPending = true
+        // SMC writes right at wake are flaky; let readings settle first.
+        retryAfter = Date().addingTimeInterval(3)
+        requestSample()
+    }
+
+    // MARK: Sampling
+
+    private func requestSample() {
+        guard active, !sleeping, !sampleInFlight else { return }
+        sampleInFlight = true
+        sensor.sample { sample in
+            Task { @MainActor [weak self] in self?.apply(sample) }
+        }
+    }
+
+    private func apply(_ sample: FanSample) {
+        sampleInFlight = false
+        guard active, !sleeping else { return }
+        if isConnected != sample.connected { isConnected = sample.connected }
+        if let fresh = sample.fans, fresh != fans { fans = fresh }
+        let error: String?
+        if !sample.connected {
+            error = "找不到 SMC（需要实体 Mac）"
+        } else if fans.isEmpty {
+            error = sample.fanError ?? errorMessage
         } else {
-            readFailStreak += 1
-            if readFailStreak >= 3 {
-                // Fan values frozen/gone usually means the SMC connection went stale; rebuild it.
-                readFailStreak = 0
-                smc.close()
-                if smc.open() { loadFans(reset: false) }
-            }
+            error = nil
         }
-        refreshTemps()
-        competitor = Self.detectCompetitor()
-        refreshCurveTarget()
-        if isEditingSpeed, Date().timeIntervalSince(speedEditBegan) < 30 { return }
-        isEditingSpeed = false
-        guard writeInFlightGeneration == nil else { return }
-        switch mode {
-        case .fixed:
-            if Date().timeIntervalSince(lastReapply) > 8, !fans.allSatisfy(\.isManual) {
+        if errorMessage != error { errorMessage = error }
+
+        let now = Date()
+        let cpu = cpuSmoother.update(sample.cpu, at: now)
+        let gpu = gpuSmoother.update(sample.gpu, at: now)
+        let hottest = hottestSmoother.update(sample.hottest, at: now)
+        // Display smoothed values too: raw CPU max jumps ~7° between 2 s samples,
+        // which made the menu bar number flicker without meaning anything.
+        setIfChanged(\.cpuTemp, Self.display(cpu ?? hottest))
+        setIfChanged(\.gpuTemp, Self.display(gpu))
+        setIfChanged(\.hottestTemp, Self.display(hottest))
+
+        smoothedControl = [cpu, gpu].compactMap { $0 }.max() ?? hottest
+        rawControl = [sample.cpu, sample.gpu].compactMap { $0 }.max() ?? sample.hottest
+        setIfChanged(\.controlTemp, smoothedControl.map { ($0 * 10).rounded() / 10 })
+
+        let other = Self.detectCompetitor()
+        if competitor != other { competitor = other }
+        drive(userInitiated: false)
+    }
+
+    private static func display(_ value: Double?) -> Double? {
+        value.map { $0.rounded() }
+    }
+
+    private func setIfChanged<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<FanController, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+    }
+
+    // MARK: Control loop
+
+    private func drive(userInitiated: Bool) {
+        let now = Date()
+        guard active, !sleeping, isConnected, !fans.isEmpty else {
+            refreshCurvePreview()
+            return
+        }
+        if !userInitiated, now < retryAfter {
+            refreshCurvePreview()
+            return
+        }
+        if takeoverPending {
+            takeoverPending = false
+            engine.reset()
+            if mode == .fixed {
                 applyFixed(silent: true)
+                return
             }
-        case .curve:
-            applyCurveIfNeeded(force: false, silent: true)
+        }
+        switch mode {
         case .auto:
+            refreshCurvePreview()
+        case .fixed:
+            refreshCurvePreview()
+            // Don't fight the slider mid-drag. Curve mode ignores this: its edits only
+            // land on commit, and it must keep running for the emergency bypass.
+            if isEditingSpeed, now.timeIntervalSince(speedEditBegan) < 30 { return }
+            isEditingSpeed = false
+            guard writeInFlightGeneration == nil, now.timeIntervalSince(lastReapply) > 8, fixedDrifted() else { return }
+            applyFixed(silent: true)
+        case .curve:
+            stepCurve(userInitiated: userInitiated, now: now)
+        }
+    }
+
+    /// Fixed mode doesn't rewrite on a timer: only when the fans visibly left our
+    /// manual setting (system reset after wake, another tool, SMC hiccup).
+    private func fixedDrifted() -> Bool {
+        fans.contains { fan in
+            let wanted = min(max(fixedRPM, fan.minRPM), fan.maxRPM)
+            return !fan.isManual || abs(fan.targetRPM - wanted) > 100
+        }
+    }
+
+    private func stepCurve(userInitiated: Bool, now: Date) {
+        // Background ticks wait for the previous write; a user switch supersedes it
+        // (writes are serialized in PrivilegedWriter anyway).
+        guard userInitiated || writeInFlightGeneration == nil else { return }
+        if engine.phase == .controlling, engine.lastWritten != nil,
+           now.timeIntervalSince(lastWriteDone) > 6, !fans.allSatisfy(\.isManual) {
+            // Something took the fans back (wake, thermalmonitord, another app): re-assert.
+            engine.invalidate()
+        }
+        let action = engine.step(
+            smoothed: smoothedControl,
+            raw: rawControl,
+            now: now,
+            sorted: FanCurve.sortedPoints(curvePoints),
+            minRPM: sliderMin,
+            maxRPM: sliderMax,
+            currentRPM: fans.map(\.actualRPM).max()
+        )
+        publishCurveState()
+        switch action {
+        case .none:
             break
+        case .write(let rpm):
+            writeRPM(rpm, silent: !userInitiated, fromCurve: true)
+        case .release:
+            releaseForCurve(userInitiated: userInitiated)
         }
     }
 
-    private func discoverTemps() {
-        let count = min(smc.keyCount(), 4000)
-        for i in 0..<count {
-            guard let key = smc.key(atIndex: i), key.first == "T" else { continue }
-            guard let value = smc.readDouble(key), value > 1, value < 125 else { continue }
-            tempKeys.append(key)
-            if key.hasPrefix("Tp") || key.hasPrefix("Te") {
-                cpuKeys.append(key)
-            }
-        }
+    private func publishCurveState() {
+        let state: CurveState = engine.emergency ? .emergency : (engine.phase == .released ? .released : .following)
+        setIfChanged(\.curveState, state)
+        setIfChanged(\.curveTargetRPM, (engine.target ?? 0).rounded())
     }
 
-    private func refreshTemps() {
-        var cpu: Double?
-        var hottest: Double?
-        for key in cpuKeys {
-            if let value = smc.readDouble(key), value > 1, value < 125 {
-                cpu = max(cpu ?? value, value)
-            }
+    /// Outside curve mode (or before the engine has run), show what the curve would do now.
+    private func refreshCurvePreview() {
+        if mode == .curve, engine.phase != .starting {
+            publishCurveState()
+            return
         }
-        for key in tempKeys {
-            if let value = smc.readDouble(key), value > 1, value < 125 {
-                hottest = max(hottest ?? value, value)
-            }
-        }
-        cpuTemp = cpu ?? hottest
-        hottestTemp = hottest
-    }
-
-    func refreshCurveTarget() {
-        let temp = cpuTemp ?? hottestTemp ?? 0
-        let floor = sliderMin
         let sorted = FanCurve.sortedPoints(curvePoints)
-        let raw = FanCurve.level(for: temp, sorted: sorted)
-        if raw > curveLevel {
-            let step = FanCurve.ascentTick(
-                rawLevel: raw,
-                currentLevel: curveLevel,
-                sorted: sorted,
-                entry: ascendEntry,
-                since: ascendSince,
-                now: Date(),
-                sustain: FanCurve.ascendSustain,
-                bypassCelsius: FanCurve.ascendBypassCelsius
-            )
-            curveLevel = step.level
-            ascendEntry = step.entry
-            ascendSince = step.since
-        } else {
-            ascendEntry = nil
-            ascendSince = nil
-            curveLevel = FanCurve.stableLevel(
-                for: temp,
-                sorted: sorted,
-                currentLevel: curveLevel,
-                hysteresis: FanCurve.dropHysteresis
-            )
+        guard let temp = smoothedControl, let lowest = sorted.first?.celsius else {
+            setIfChanged(\.curveTargetRPM, 0)
+            return
         }
-        var target = FanCurve.rpm(level: curveLevel, sorted: sorted, floor: floor)
-        if temp >= 100 { target = sliderMax }
-        curveTargetRPM = min(max(target, sliderMin), sliderMax)
-    }
-
-    /// Curve edits invalidate the held level and any pending ascend wait;
-    /// re-derive from raw temp on the new curve.
-    private func resetCurveLevel() {
-        let temp = cpuTemp ?? hottestTemp ?? 0
-        curveLevel = FanCurve.level(for: temp, sorted: FanCurve.sortedPoints(curvePoints))
-        ascendEntry = nil
-        ascendSince = nil
+        if temp < lowest - CurveEngine.handoverMargin {
+            setIfChanged(\.curveState, .released)
+            setIfChanged(\.curveTargetRPM, 0)
+            return
+        }
+        setIfChanged(\.curveState, .following)
+        let rpm = FanCurve.interpolatedRPM(for: temp, sorted: sorted) ?? sliderMin
+        setIfChanged(\.curveTargetRPM, min(max(rpm, sliderMin), sliderMax).rounded())
     }
 
     static func detectCompetitor() -> String? {
@@ -749,6 +792,8 @@ final class FanController: ObservableObject {
         return nil
     }
 
+    // MARK: User actions
+
     func authorize() {
         applying = true
         writeError = nil
@@ -759,13 +804,14 @@ final class FanController: ObservableObject {
                 self.applying = false
                 self.passwordless = ok
                 self.needsAdmin = !ok
+                if ok { self.retryAfter = .distantPast }
             }
         }
     }
 
     nonisolated private static func setAutoWithRetry() -> PrivilegedWriter.Outcome {
         var outcome = PrivilegedWriter.setAllAuto()
-        if !outcome.ok {
+        if !outcome.ok, !outcome.unauthorized {
             Thread.sleep(forTimeInterval: 0.4)
             outcome = PrivilegedWriter.setAllAuto()
         }
@@ -774,7 +820,7 @@ final class FanController: ObservableObject {
 
     nonisolated private static func setFixedWithRetry(rpm: Double, promptIfNeeded: Bool) -> PrivilegedWriter.Outcome {
         var outcome = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: promptIfNeeded)
-        if !outcome.ok {
+        if !outcome.ok, !outcome.unauthorized {
             Thread.sleep(forTimeInterval: 0.4)
             outcome = PrivilegedWriter.setAllFixed(rpm: rpm, promptIfNeeded: promptIfNeeded)
         }
@@ -783,6 +829,9 @@ final class FanController: ObservableObject {
 
     func selectAuto() {
         mode = .auto
+        engine.reset()
+        takeoverPending = false
+        guard active else { return }
         applying = true
         writeError = nil
         applyGeneration += 1
@@ -790,13 +839,12 @@ final class FanController: ObservableObject {
         writeInFlightGeneration = generation
         Task.detached { [weak self] in
             let outcome = Self.setAutoWithRetry()
-            let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 guard self.applyGeneration == generation else { return }
                 self.writeInFlightGeneration = nil
                 self.applying = false
-                self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "交还系统控制失败，请再试一次。", detail: outcome.detail)
+                self.recordResult(outcome, failText: "交还系统控制失败，请再试一次。")
                 if outcome.ok {
                     for i in self.fans.indices { self.fans[i].isManual = false }
                 }
@@ -806,13 +854,16 @@ final class FanController: ObservableObject {
 
     func selectFixed() {
         mode = .fixed
+        takeoverPending = false
         applyFixed()
     }
 
     func selectCurve() {
         mode = .curve
-        refreshCurveTarget()
-        applyCurveIfNeeded(force: true, silent: false)
+        engine.reset()
+        takeoverPending = false
+        retryAfter = .distantPast
+        drive(userInitiated: true)
     }
 
     func beginSpeedEdit() {
@@ -839,7 +890,7 @@ final class FanController: ObservableObject {
         let clamped = min(max(fixedRPM, sliderMin), sliderMax)
         fixedRPM = clamped
         persistRPM()
-        writeRPM(clamped, silent: silent)
+        writeRPM(clamped, silent: silent, fromCurve: false)
     }
 
     func addCurvePoint() {
@@ -854,17 +905,13 @@ final class FanController: ObservableObject {
         guard !taken.contains(Int(nextTemp.rounded())) else { return }
         let nextRPM = min(max(lastRPM + 500, sliderMin), sliderMax)
         curvePoints.append(FanCurvePoint(celsius: nextTemp, rpm: nextRPM))
-        persistCurve()
-        resetCurveLevel()
-        scheduleCurveApply()
+        curveEdited()
     }
 
     func removeCurvePoint(_ id: UUID) {
         guard curvePoints.count > 1 else { return }
         curvePoints.removeAll { $0.id == id }
-        persistCurve()
-        resetCurveLevel()
-        scheduleCurveApply()
+        curveEdited()
     }
 
     func updateCurvePoint(id: UUID, celsius: Double? = nil, rpm: Double? = nil) {
@@ -875,80 +922,82 @@ final class FanController: ObservableObject {
         if let rpm {
             curvePoints[index].rpm = min(max(rpm, sliderMin), sliderMax)
         }
+        curveEdited()
+    }
+
+    /// The engine picks the new curve up on its next tick and ramps toward it.
+    private func curveEdited() {
         persistCurve()
-        resetCurveLevel()
-        scheduleCurveApply()
+        refreshCurvePreview()
     }
 
-    private func scheduleCurveApply() {
-        refreshCurveTarget()
-        guard mode == .curve else { return }
-        curveDebounce?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.applyCurveIfNeeded(force: true, silent: false)
-        }
-        curveDebounce = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
-    }
+    // MARK: Writes
 
-    private func applyCurveIfNeeded(force: Bool, silent: Bool) {
-        refreshCurveTarget()
-        let target = curveTargetRPM
-        let stale = Date().timeIntervalSince(lastReapply) > 8 && !fans.allSatisfy(\.isManual)
-        let changed = lastAppliedRPM.map { abs($0 - target) >= 80 } ?? true
-        guard force || stale || changed else { return }
-        if silent, !force, Date().timeIntervalSince(lastSilentCurveApply) < 3 { return }
-        if silent { lastSilentCurveApply = Date() }
-        writeRPM(target, silent: silent)
-    }
-
-    private func writeRPM(_ rpm: Double, silent: Bool) {
-        lastAppliedRPM = rpm
+    private func writeRPM(_ rpm: Double, silent: Bool, fromCurve: Bool) {
+        guard active else { return }
         lastReapply = Date()
         applyGeneration += 1
         let generation = applyGeneration
         writeInFlightGeneration = generation
-        if silent {
-            Task.detached { [weak self] in
-                let outcome = Self.setFixedWithRetry(rpm: rpm, promptIfNeeded: false)
-                let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    if self.writeInFlightGeneration == generation { self.writeInFlightGeneration = nil }
-                    guard self.applyGeneration == generation else { return }
-                    self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "自动调整转速失败，请重新切换一次策略。", detail: outcome.detail)
-                }
-            }
-            return
+        if !silent {
+            applying = true
+            writeError = nil
         }
-        applying = true
-        writeError = nil
         Task.detached { [weak self] in
-            let outcome = Self.setFixedWithRetry(rpm: rpm, promptIfNeeded: true)
-            let passwordless = outcome.ok || PrivilegedWriter.hasPasswordlessSudo()
+            let outcome = Self.setFixedWithRetry(rpm: rpm, promptIfNeeded: !silent)
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                if self.writeInFlightGeneration == generation { self.writeInFlightGeneration = nil }
                 guard self.applyGeneration == generation else { return }
-                self.writeInFlightGeneration = nil
-                self.applying = false
-                self.recordResult(ok: outcome.ok, passwordless: passwordless, failText: "写入转速失败，请再试一次。", detail: outcome.detail)
+                if !silent { self.applying = false }
+                self.lastWriteDone = Date()
+                if !outcome.ok {
+                    if fromCurve { self.engine.writeFailed() }
+                    self.retryAfter = Date().addingTimeInterval(outcome.unauthorized ? 30 : 6)
+                }
+                let failText = silent ? "自动调整转速失败，请重新切换一次策略。" : "写入转速失败，请再试一次。"
+                self.recordResult(outcome, failText: failText)
             }
         }
     }
 
-    private func recordResult(ok: Bool, passwordless: Bool, failText: String, detail: String = "") {
-        self.passwordless = passwordless
-        if ok {
+    /// Curve fell below its lowest point: give the fans back to the system (may stop them).
+    private func releaseForCurve(userInitiated: Bool) {
+        guard active else { return }
+        applyGeneration += 1
+        let generation = applyGeneration
+        writeInFlightGeneration = generation
+        Task.detached { [weak self] in
+            let outcome = PrivilegedWriter.setAllAuto(promptIfNeeded: userInitiated)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.writeInFlightGeneration == generation { self.writeInFlightGeneration = nil }
+                guard self.applyGeneration == generation else { return }
+                self.lastWriteDone = Date()
+                if outcome.ok {
+                    for i in self.fans.indices { self.fans[i].isManual = false }
+                } else {
+                    self.engine.releaseFailed()
+                    self.retryAfter = Date().addingTimeInterval(outcome.unauthorized ? 30 : 6)
+                }
+                self.recordResult(outcome, failText: "交还系统控制失败。")
+            }
+        }
+    }
+
+    private func recordResult(_ outcome: PrivilegedWriter.Outcome, failText: String) {
+        passwordless = outcome.ok || !outcome.unauthorized
+        if outcome.ok {
             needsAdmin = false
             writeError = nil
             return
         }
-        if passwordless {
-            needsAdmin = false
-            writeError = detail.isEmpty ? failText : "\(failText)（\(detail)）"
-        } else {
+        if outcome.unauthorized {
             needsAdmin = true
             writeError = nil
+        } else {
+            needsAdmin = false
+            writeError = outcome.detail.isEmpty ? failText : "\(failText)（\(outcome.detail)）"
         }
     }
 
