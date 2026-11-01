@@ -20,6 +20,7 @@ swiftc -O -parse-as-library \
   -framework ServiceManagement \
   -framework Carbon \
   -framework ImageIO \
+  -framework Vision \
   -o "$BIN" \
   "$ROOT"/Sources/*.swift
 
