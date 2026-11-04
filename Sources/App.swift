@@ -13,6 +13,9 @@ enum OneBarEntry {
         if args.count >= 2, args[1] == "selftest" {
             exit(FanCurve.runSelfTest())
         }
+        if args.count >= 2, args[1] == "selftest-menu-bar" {
+            exit(MenuBarSelection.runSelfTest())
+        }
         if args.count >= 2, args[1] == "snapshot" {
             exit(Snapshotter.run(outputDir: args.count >= 3 ? args[2] : NSTemporaryDirectory()))
         }
@@ -31,15 +34,22 @@ enum OneBarEntry {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var state: AppState?
     private var statusBar: StatusBarController?
+    private var menuBar: MenuBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         let state = AppState()
         self.state = state
         statusBar = StatusBarController(state: state)
+        menuBar = MenuBarController()
+        state.menuBar = menuBar
+        if CommandLine.arguments.contains("--menu-bar") {
+            DispatchQueue.main.async { [weak self] in self?.menuBar?.toggle() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        menuBar?.stop()
         state?.fan.restoreAutoOnQuit()
     }
 
@@ -151,6 +161,10 @@ final class StatusBarController: NSObject {
         guard event.type == .rightMouseUp || event.modifierFlags.contains(.control) else { return false }
         guard let button = item.button else { return false }
         let menu = NSMenu()
+        let organizer = NSMenuItem(title: "菜单栏收纳…", action: #selector(menuOrganizer), keyEquivalent: "")
+        organizer.target = self
+        menu.addItem(organizer)
+        menu.addItem(.separator())
         let relaunch = NSMenuItem(title: "重新启动", action: #selector(menuRelaunch), keyEquivalent: "")
         relaunch.target = self
         menu.addItem(relaunch)
@@ -163,6 +177,7 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func menuRelaunch() { state.relaunch() }
+    @objc private func menuOrganizer() { state.menuBar?.toggle() }
     @objc private func menuQuit() { state.quit() }
 
     private func toggle(_ popover: NSPopover, from item: NSStatusItem) {
@@ -191,6 +206,7 @@ final class AppState: ObservableObject {
     let clipboard = ClipboardStore()
     let fan = FanController()
     weak var clipboardWindow: ClipboardWindowController?
+    weak var menuBar: MenuBarController?
 
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
@@ -244,11 +260,13 @@ final class AppState: ObservableObject {
     }
 
     func quit() {
+        menuBar?.stop()
         fan.restoreAutoOnQuit()
         NSApp.terminate(nil)
     }
 
     func relaunch() {
+        menuBar?.stop()
         fan.restoreAutoOnQuit()
         let bundle = Bundle.main.bundlePath
         let pid = ProcessInfo.processInfo.processIdentifier

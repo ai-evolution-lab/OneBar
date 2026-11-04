@@ -1,6 +1,7 @@
 # OneBar
 
 macOS 菜单栏工具：内存、剪贴板、风扇（自动 / 固定转速 / 温度曲线）。
+另支持 macOS 27 的第三方菜单栏图标收纳：下拉勾选需要常驻显示的应用。
 
 ## 使用说明
 
@@ -15,6 +16,10 @@ curl -fsSL https://raw.githubusercontent.com/ai-evolution-lab/OneBar/master/Scri
 装好后就是一个普通的 `.app`：打开 **Finder → 应用程序 → OneBar**，双击即可启动。没有开「开机启动」也没关系，下次还是去这里双击。
 
 **退出 / 重新启动：** 右键菜单栏上任意 OneBar 图标（内存、风扇、剪贴板），选「退出」或「重新启动」。内存和风扇面板底部也有这两个按钮。
+
+**菜单栏收纳（macOS 27+）：** 点击 OneBar 的托盘图标，或右键任一 OneBar 图标 →「菜单栏收纳…」，在下拉面板勾选常驻显示的应用。例如 10 个应用只勾选 3 个，其余 7 个即收纳；重新勾选即可单独恢复，重启后保留选择。首次需在「系统设置 → 隐私与安全性 → 辅助功能」允许 OneBar，授权后列表自动更新。「全部显示」清除收纳选择。
+
+收纳按应用生效，同一应用的多个图标一起切换；OneBar 与系统图标始终保留，新应用默认显示。macOS 27 的收纳接口要求应用安装在 `/Applications`，请从 `/Applications/OneBar.app` 运行；系统设置已禁止显示的图标仍需去系统设置中开启。此功能动态调用系统私有接口，接口缺失或激活失败时会显示原因并释放收纳。退出 OneBar 时恢复显示，下次启动重新应用选择。macOS 14–26 的原有功能仍可使用。
 
 ## 项目介绍
 
@@ -64,5 +69,7 @@ open build/OneBar.app
 Scripts/build.sh /Applications/OneBar.app
 open /Applications/OneBar.app
 ```
+
+选择逻辑自测：`build/OneBar.app/Contents/MacOS/OneBar selftest-menu-bar`。
 
 打 Release zip：`Scripts/package.sh`，产物在 `build/OneBar.app.zip`。
